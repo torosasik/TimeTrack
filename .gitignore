@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+.env
+.env.local
+.env.*.local
+.firebase/
+.firebaserc
+firebase-debug.log
+firestore-debug.log
+.npm-cache/
+.cursor/
+
+# Ignore Firebase config if it contains secrets
+# (Uncomment if you add secrets to config file)
+# src/config/firebase.config.js

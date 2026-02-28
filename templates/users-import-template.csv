@@ -1,0 +1,4 @@
+name,email,role,active
+Jane Employee,jane.employee@americantiledepot.com,employee,true
+Mike Manager,mike.manager@americantiledepot.com,manager,true
+
