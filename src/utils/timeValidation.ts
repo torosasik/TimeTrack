@@ -232,3 +232,89 @@ export function formatTimeWithAMPM(time: string): string {
 
     return `${displayHours}:${minutes.toString().padStart(2, '0')} ${ampm}`;
 }
+
+export interface AnomalyResult {
+    hasAnomaly: boolean;
+    message?: string;
+}
+
+/**
+ * Check for unusual time entries that warrant a warning/confirmation
+ * @param step - Current step index (0 = Clock In, 1 = Lunch Out, 2 = Lunch In, 3 = Clock Out)
+ * @param time - Current time string (HH:MM)
+ * @param workDate - Entry date (YYYY-MM-DD)
+ * @param entry - The current TimeEntry object (for comparing previous times)
+ * @returns { hasAnomaly, message }
+ */
+export function checkTimeAnomalies(
+    step: number | 'complete',
+    time: string,
+    workDate: string,
+    entry: any
+): AnomalyResult {
+    if (!time || step === 'complete') return { hasAnomaly: false };
+
+    const timeMins = timeToMinutes(time);
+
+    const standardWarningMessage = "This entry looks unusual. Please confirm that this is correct.";
+
+    // 1. Weekend Check
+    try {
+        const date = new Date(workDate + 'T00:00:00');
+        const day = date.getDay();
+        if (day === 0 || day === 6) { // Sunday or Saturday
+            return {
+                hasAnomaly: true,
+                message: standardWarningMessage
+            };
+        }
+    } catch (e) { /* ignore date parse errors */ }
+
+    // 2. Early Arrival Check (Before 6:00 AM)
+    if (step === 0) { // Clock In
+        if (timeMins < 6 * 60) {
+            return {
+                hasAnomaly: true,
+                message: standardWarningMessage
+            };
+        }
+    }
+
+    // 3. Late Departure Check (After 6:00 PM)
+    if (step === 3) { // Clock Out
+        if (timeMins > 18 * 60) {
+            return {
+                hasAnomaly: true,
+                message: standardWarningMessage
+            };
+        }
+    }
+
+    // 4. Short Interval Check (Less than 1 hour between Clock In and Lunch Out/Clock Out)
+    if (entry && entry.clockInManual && (step === 1 || step === 3)) {
+        const clockInMins = timeToMinutes(entry.clockInManual);
+        const diffMins = timeMins - clockInMins;
+
+        if (diffMins > 0 && diffMins < 60) {
+            return {
+                hasAnomaly: true,
+                message: standardWarningMessage
+            };
+        }
+    }
+
+    // 5. Very Long Shift Check (More than 12 hours between Clock In and Clock Out)
+    if (entry && entry.clockInManual && step === 3) {
+        const clockInMins = timeToMinutes(entry.clockInManual);
+        const shiftDuration = timeMins - clockInMins;
+
+        if (shiftDuration > 12 * 60) {
+            return {
+                hasAnomaly: true,
+                message: `This entry looks unusual (shift is over 12 hours). Please confirm that this is correct.`
+            };
+        }
+    }
+
+    return { hasAnomaly: false };
+}

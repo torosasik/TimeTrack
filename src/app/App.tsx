@@ -9,17 +9,18 @@ import { AdminPanel } from './components/admin/AdminPanel';
 import { PayrollReports } from './components/admin/PayrollReports';
 import { AuditViewer } from './components/admin/AuditViewer';
 import { PatternMetrics } from './components/admin/PatternMetrics';
+import { CorrectionRequests } from './components/admin/CorrectionRequests';
 import { Button } from './components/ui/button';
 import { Card } from './components/ui/card';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './components/ui/tabs';
 import { Badge } from './components/ui/badge';
 import { UserAvatar } from './components/ui/user-avatar';
 import { Toaster } from './components/ui/sonner';
-import { LogOut, Clock, Users, Settings, FileText, Search, TrendingUp } from 'lucide-react';
+import { LogOut, Clock, Users, Settings, FileText, Search, TrendingUp, FileWarning } from 'lucide-react';
 
 type EmployeeView = 'today' | 'history';
 type ManagerView = 'dashboard';
-type AdminView = 'panel' | 'payroll' | 'audit' | 'metrics';
+type AdminView = 'panel' | 'payroll' | 'audit' | 'metrics' | 'corrections';
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -36,6 +37,21 @@ export default function App() {
   // View state
   const [employeeView, setEmployeeView] = useState<EmployeeView>('today');
   const [adminView, setAdminView] = useState<AdminView>('panel');
+
+  const [isOffline, setIsOffline] = useState(!navigator.onLine);
+
+  useEffect(() => {
+    const handleOnline = () => setIsOffline(false);
+    const handleOffline = () => setIsOffline(true);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
 
   useEffect(() => {
     const unsubscribe = authService.onAuthStateChanged((user) => {
@@ -91,37 +107,37 @@ export default function App() {
   if (!currentUser) {
     return (
       <>
-        <LoginPage onLoginSuccess={() => {}} />
+        <LoginPage onLoginSuccess={() => { }} />
         <Toaster />
       </>
     );
   }
 
   const renderHeader = () => (
-    <header className="bg-card border-b border-border shadow-sm sticky top-0 z-50">
+    <header className="bg-white/70 backdrop-blur-xl border-b border-indigo-100/50 shadow-sm sticky top-0 z-50">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 md:py-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2 md:gap-3">
-            <div className="bg-primary p-2 md:p-2.5 rounded-lg">
-              <Clock className="size-5 md:size-6 text-primary-foreground" />
+            <div className="bg-gradient-to-tr from-indigo-600 to-violet-500 p-2 md:p-2.5 rounded-xl shadow-md shadow-indigo-500/20">
+              <Clock className="size-5 md:size-6 text-white" />
             </div>
             <div>
-              <h1 className="font-bold text-foreground text-base md:text-lg">TimeTracker</h1>
-              <p className="text-xs md:text-sm text-muted-foreground hidden sm:block">Welcome back!</p>
+              <h1 className="font-bold text-slate-900 text-base md:text-lg tracking-tight">TimeTracker</h1>
+              <p className="text-xs md:text-sm text-slate-500 hidden sm:block font-medium">Welcome back!</p>
             </div>
             {(testMode || usingEmulators) && (
-              <div className="hidden sm:flex items-center gap-2 ml-2">
-                {usingEmulators && <Badge variant="outline">EMULATORS</Badge>}
-                {testMode && <Badge variant="secondary">TEST MODE</Badge>}
+              <div className="hidden sm:flex items-center gap-2 ml-4">
+                {usingEmulators && <Badge variant="outline" className="border-indigo-200 text-indigo-700 bg-indigo-50/50">EMULATORS</Badge>}
+                {testMode && <Badge variant="secondary" className="bg-violet-100 text-violet-800">TEST MODE</Badge>}
               </div>
             )}
           </div>
           <div className="flex items-center gap-2 md:gap-3">
-            <div className="hidden sm:flex items-center gap-3">
+            <div className="hidden sm:flex items-center gap-3 bg-white/50 px-3 py-1.5 rounded-full border border-slate-200/60 shadow-sm">
               <div className="text-right">
-                <p className="text-sm font-medium text-foreground">{currentUser.name}</p>
-                <p className="text-xs text-muted-foreground">
-                  {currentUser.role === 'employee' ? `Employee #${currentUser.uid.padStart(4, '0')}` : currentUser.role}
+                <p className="text-sm font-bold text-slate-800 tracking-tight">{currentUser.name}</p>
+                <p className="text-xs text-indigo-600 font-medium uppercase tracking-wider">
+                  {currentUser.role === 'employee' ? `Emp #${currentUser.uid.substring(0, 4)}` : currentUser.role}
                 </p>
               </div>
               <UserAvatar name={currentUser.name} size="md" />
@@ -130,14 +146,14 @@ export default function App() {
             <div className="sm:hidden">
               <UserAvatar name={currentUser.name} size="sm" />
             </div>
-            <Button 
-              variant="outline" 
+            <Button
+              variant="outline"
               onClick={handleLogout}
               size="sm"
-              className="h-8 md:h-10"
+              className="h-9 md:h-10 rounded-full border-slate-200 text-slate-600 hover:bg-slate-50 hover:text-slate-900 transition-colors"
             >
               <LogOut className="size-4" />
-              <span className="hidden md:inline ml-2">Sign Out</span>
+              <span className="hidden md:inline ml-2 font-medium">Sign Out</span>
             </Button>
           </div>
         </div>
@@ -202,7 +218,7 @@ export default function App() {
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
       <Tabs value={adminView} onValueChange={(v) => setAdminView(v as AdminView)} className="space-y-4">
         <div className="overflow-x-auto -mx-4 px-4 sm:mx-0 sm:px-0">
-          <TabsList className="grid grid-cols-3 sm:grid-cols-5 w-full gap-1">
+          <TabsList className="grid grid-cols-3 sm:grid-cols-6 w-full gap-1">
             <TabsTrigger value="panel" className="text-xs sm:text-sm">
               <Settings className="size-4 mr-0 sm:mr-2" />
               <span className="hidden sm:inline">Admin</span>
@@ -225,6 +241,11 @@ export default function App() {
             <TabsTrigger value="team" className="text-xs sm:text-sm">
               <Users className="size-4 mr-0 sm:mr-2" />
               <span>Team</span>
+            </TabsTrigger>
+            <TabsTrigger value="corrections" className="text-xs sm:text-sm">
+              <FileWarning className="size-4 mr-0 sm:mr-2" />
+              <span className="hidden sm:inline">Corrections</span>
+              <span className="sm:hidden">Fix</span>
             </TabsTrigger>
           </TabsList>
         </div>
@@ -252,14 +273,23 @@ export default function App() {
         <TabsContent value="team">
           <TeamDashboard user={currentUser} allUsers={allUsers} />
         </TabsContent>
+
+        <TabsContent value="corrections">
+          <CorrectionRequests currentUser={currentUser} />
+        </TabsContent>
       </Tabs>
     </div>
   );
 
   return (
     <div className="min-h-screen bg-background">
+      {isOffline && (
+        <div className="bg-amber-500 text-white text-center py-2 px-4 text-sm font-medium animate-in slide-in-from-top-2">
+          You are currently offline. Time entries will be saved when your connection is restored.
+        </div>
+      )}
       {renderHeader()}
-      
+
       {currentUser.role === 'employee' && renderEmployeeView()}
       {currentUser.role === 'manager' && renderManagerView()}
       {currentUser.role === 'admin' && renderAdminView()}

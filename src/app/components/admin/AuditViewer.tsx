@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { User } from '../../lib/auth';
+import { SectionHelp } from '../ui/section-help';
 import { TimeEntry, dbService } from '../../lib/database';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
@@ -9,8 +10,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Badge } from '../ui/badge';
 import { Checkbox } from '../ui/checkbox';
 import { toast } from 'sonner';
-import { Search, AlertTriangle, Clock, Shield, Download } from 'lucide-react';
+import { Search, AlertTriangle, Clock, Shield, Download, Info } from 'lucide-react';
 import { generateCSV, downloadCSV } from '../../../services/exportService';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip';
 
 interface AuditViewerProps {
   allUsers: User[];
@@ -48,7 +50,7 @@ export function AuditViewer({ allUsers }: AuditViewerProps) {
       const filteredEntries = allEntries.filter(entry => {
         const inDateRange = entry.date >= startDate && entry.date <= endDate;
         const matchesUser = selectedUserId === 'all' || entry.userId === selectedUserId;
-        return inDateRange && matchesUser && entry.complete;
+        return inDateRange && matchesUser && !!entry.clockInManual && !!entry.clockOutManual;
       });
 
       const auditResults: AuditResult[] = filteredEntries.map(entry => {
@@ -165,6 +167,20 @@ export function AuditViewer({ allUsers }: AuditViewerProps) {
 
   return (
     <div className="space-y-4">
+      <div className="flex justify-between items-center bg-white p-4 rounded-2xl border border-slate-200/80 shadow-sm mb-2">
+        <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+          Audit Viewer
+        </h2>
+        <SectionHelp 
+          title="Audit Viewer"
+          description="Identify inconsistencies, suspicious flags, and manual timestamp gaps."
+          sections={[
+            { title: "Suspicious Flags", content: "Marks entries having high correction count or anomalous total totals." },
+            { title: "Manual Gaps", content: "Highlights discrepancies between absolute punch triggers and safe averages." },
+            { title: "Exporting", content: "Use top controls to download periodic discrepancies stream datasets for accountability." }
+          ]}
+        />
+      </div>
       {/* Filters Card */}
       <Card className="border-2 border-slate-200">
         <CardHeader className="pb-3">
@@ -250,7 +266,19 @@ export function AuditViewer({ allUsers }: AuditViewerProps) {
                   <AlertTriangle className="size-5 text-amber-600" />
                 </div>
                 <div>
-                  <p className="text-xs text-slate-600">Suspicious</p>
+                  <div className="flex items-center gap-1">
+                    <p className="text-xs text-slate-600">Suspicious</p>
+                    <TooltipProvider>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Info className="size-3 text-slate-400 cursor-help" />
+                        </TooltipTrigger>
+                        <TooltipContent className="max-w-xs bg-slate-900 text-slate-50 border-slate-800">
+                          <p>Suspicious entries include: Edited entries (batch submit), Missing clock-out/late submission, Shifts exceeding long-shift threshold.</p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  </div>
                   <p className="text-2xl font-bold text-slate-900">{suspiciousCount}</p>
                 </div>
               </div>

@@ -46,8 +46,10 @@ service cloud.firestore {
     
     // Time entries collection
     match /timeEntries/{entryId} {
-      // Users can read their own entries
-      allow read: if isAuthenticated() && 
+      // Users can get individual entries (even non-existent ones) or list their own entries
+      allow get: if isAuthenticated() && 
+                    (resource == null || resource.data.userId == request.auth.uid);
+      allow list: if isAuthenticated() && 
                      resource.data.userId == request.auth.uid;
       
       // Managers can read entries from all users
@@ -65,5 +67,35 @@ service cloud.firestore {
       // Only admins can delete entries
       allow delete: if hasRole('admin');
     }
+    
+    // Correction Requests collection
+    match /correctionRequests/{requestId} {
+      // Employees can create their own requests
+      allow create: if isAuthenticated() && 
+                       request.resource.data.employee_id == request.auth.uid &&
+                       isActive();
+      
+      // Employees can read their own requests
+      allow list: if isAuthenticated() && 
+                     resource.data.employee_id == request.auth.uid;
+      allow get: if isAuthenticated() && 
+                    (resource == null || resource.data.employee_id == request.auth.uid);
+      
+      // Managers and admins can read all requests
+      allow read: if hasRole('manager') || hasRole('admin');
+      
+      // Only admins can update requests (status changes)
+      allow update: if hasRole('admin');
+    }
+    
+    // System Settings collection
+    match /systemSettings/{document} {
+      // Admins can read and write all system settings
+      allow read, write: if hasRole('admin');
+      
+      // All authenticated users can read payroll settings to respect lock dates
+      allow read: if isAuthenticated() && document == 'payroll';
+    }
   }
 }
+

@@ -17,10 +17,11 @@ export default defineConfig({
   base: '/',
   server: {
     port: 5173,
+    host: '127.0.0.1',
     open: true,
   },
   build: {
-    outDir: 'dist',
+    outDir: 'build_output',
     sourcemap: false,
     assetsDir: 'assets',
     rollupOptions: {

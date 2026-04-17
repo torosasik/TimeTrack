@@ -75,6 +75,22 @@ export function minutesToDecimalHours(minutes: number): string {
 }
 
 /**
+ * Convert decimal hours (e.g., 2.63) to a clean "H:MM" string (e.g., "2:38").
+ * Rounds to the nearest minute. Handles negative / NaN gracefully.
+ * @param decimalHours - Hours as a decimal number
+ * @returns "H:MM" string — no leading zero on hours (e.g., "2:38", "0:05", "12:30")
+ */
+export function formatHoursHMM(decimalHours: number | null | undefined): string {
+    if (decimalHours === null || decimalHours === undefined || Number.isNaN(Number(decimalHours))) {
+        return '0:00';
+    }
+    const totalMinutes = Math.max(0, Math.round(Number(decimalHours) * 60));
+    const h = Math.floor(totalMinutes / 60);
+    const m = totalMinutes % 60;
+    return `${h}:${String(m).padStart(2, '0')}`;
+}
+
+/**
  * Validate time entry and return array of errors
  * @param entry - Time entry object
  * @returns Array of error messages

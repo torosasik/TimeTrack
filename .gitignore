@@ -1,5 +1,7 @@
 node_modules/
 dist/
+build_output/
+build_temp/
 .DS_Store
 *.log
 .env
@@ -11,7 +13,15 @@ firebase-debug.log
 firestore-debug.log
 .npm-cache/
 .cursor/
+.claude/
+
+# Secrets / credentials — never commit
+sa-key.json
+users.json
+test_users.csv
+time-entries-*.csv
 
 # Ignore Firebase config if it contains secrets
 # (Uncomment if you add secrets to config file)
 # src/config/firebase.config.js
+functions/.env

@@ -1,46 +1,150 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { User } from '../../lib/auth';
 import { TimeEntry, dbService } from '../../lib/database';
 import { Button } from '../ui/button';
 import { Card, CardContent } from '../ui/card';
 import { Badge } from '../ui/badge';
+import { Input } from '../ui/input';
+import { Label } from '../ui/label';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../ui/table';
-import { ArrowLeft, AlertTriangle, Clock, Calendar, Target, ChevronLeft, ChevronRight } from 'lucide-react';
+import { ArrowLeft, AlertTriangle, Clock, Calendar, Target, ChevronLeft, ChevronRight, Filter, X } from 'lucide-react';
 import { toast } from 'sonner';
+import { formatHoursHMM } from '../../../utils/timeCalculations';
 
 interface HistoryViewProps {
   user: User;
   onBack: () => void;
 }
 
-type PeriodFilter = 'last-month' | 'this-month' | 'custom';
+type PeriodFilter = 'this-week' | 'last-week' | 'custom';
+
+/** Get Monday of the current week in the given timezone, as YYYY-MM-DD */
+function getWeekBounds(timezone: string, offset: 'this' | 'last'): { start: string; end: string } {
+  // Get "now" in the employee's timezone
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' });
+  const todayStr = formatter.format(now); // YYYY-MM-DD in employee TZ
+  const [y, m, d] = todayStr.split('-').map(Number);
+  const today = new Date(y, m - 1, d);
+
+  // JS getDay(): 0=Sun. We want Monday=0.
+  const dayOfWeek = today.getDay();
+  const daysSinceMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+
+  const monday = new Date(today);
+  monday.setDate(today.getDate() - daysSinceMonday);
+
+  if (offset === 'last') {
+    monday.setDate(monday.getDate() - 7);
+  }
+
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
+
+  const fmt = (dt: Date) => {
+    const yy = dt.getFullYear();
+    const mm = String(dt.getMonth() + 1).padStart(2, '0');
+    const dd = String(dt.getDate()).padStart(2, '0');
+    return `${yy}-${mm}-${dd}`;
+  };
+
+  return { start: fmt(monday), end: offset === 'this' ? todayStr : fmt(sunday) };
+}
+
+function formatDateRange(start: string, end: string): string {
+  const s = new Date(start + 'T00:00:00');
+  const e = new Date(end + 'T00:00:00');
+  const opts: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', year: 'numeric' };
+  return `${s.toLocaleDateString('en-US', opts)} – ${e.toLocaleDateString('en-US', opts)}`;
+}
 
 export function HistoryView({ user, onBack }: HistoryViewProps) {
   const [entries, setEntries] = useState<TimeEntry[]>([]);
   const [loading, setLoading] = useState(true);
-  const [periodFilter, setPeriodFilter] = useState<PeriodFilter>('this-month');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [periodFilter, setPeriodFilter] = useState<PeriodFilter>('this-week');
   const [currentPage, setCurrentPage] = useState(1);
   const entriesPerPage = 10;
 
-  useEffect(() => {
-    loadHistory();
-  }, []);
+  // Custom date range
+  const [customStart, setCustomStart] = useState('');
+  const [customEnd, setCustomEnd] = useState('');
+  const [appliedRange, setAppliedRange] = useState<{ start: string; end: string } | null>(null);
 
-  const loadHistory = async () => {
+  const tz = user.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  const getDateRange = useCallback((): { start: string; end: string } | null => {
+    if (periodFilter === 'this-week') return getWeekBounds(tz, 'this');
+    if (periodFilter === 'last-week') return getWeekBounds(tz, 'last');
+    if (periodFilter === 'custom') return appliedRange;
+    return null;
+  }, [periodFilter, tz, appliedRange]);
+
+  const loadHistory = useCallback(async () => {
     setLoading(true);
+    setErrorMessage(null);
     try {
-      const data = await dbService.getTimeEntriesForUser(user.uid);
+      const range = getDateRange();
+      let data: TimeEntry[];
+      if (range) {
+        console.log(`[History] Querying entries for ${user.uid} from ${range.start} to ${range.end}`);
+        data = await dbService.getTimeEntriesForUserInRange(user.uid, range.start, range.end);
+      } else {
+        // No range (custom not yet applied) — show nothing
+        data = [];
+      }
       setEntries(data);
-    } catch (error) {
-      toast.error('Failed to load history');
+    } catch (error: any) {
+      const msg = error?.message || error?.code || 'Unknown error';
+      console.error('[History] Failed to load history:', error);
+      setErrorMessage(`Failed to load history: ${msg}`);
+      setEntries([]);
     } finally {
       setLoading(false);
     }
+  }, [user.uid, getDateRange]);
+
+  useEffect(() => {
+    if (periodFilter !== 'custom') {
+      loadHistory();
+    }
+  }, [periodFilter, loadHistory]);
+
+  // When custom filter is selected but no range applied yet, clear entries
+  useEffect(() => {
+    if (periodFilter === 'custom' && !appliedRange) {
+      setEntries([]);
+      setLoading(false);
+    } else if (periodFilter === 'custom' && appliedRange) {
+      loadHistory();
+    }
+  }, [periodFilter, appliedRange, loadHistory]);
+
+  const handleApplyCustom = () => {
+    if (!customStart || !customEnd) {
+      toast.error('Please select both start and end dates.');
+      return;
+    }
+    if (customEnd < customStart) {
+      toast.error('End date cannot be before start date.');
+      return;
+    }
+    // Max 90 days
+    const start = new Date(customStart + 'T00:00:00');
+    const end = new Date(customEnd + 'T00:00:00');
+    const diffDays = Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
+    if (diffDays > 90) {
+      toast.error('Date range cannot exceed 90 days.');
+      return;
+    }
+    setAppliedRange({ start: customStart, end: customEnd });
+    setCurrentPage(1);
   };
 
   const formatDate = (dateStr: string) => {
-    const date = new Date(dateStr);
+    const date = new Date(dateStr + 'T00:00:00');
     return date.toLocaleDateString('en-US', {
+      weekday: 'short',
       month: 'short',
       day: 'numeric',
       year: 'numeric'
@@ -67,13 +171,10 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
     return `${totalMinutes}m`;
   };
 
-  const formatHoursMinutes = (hours: number) => {
-    const h = Math.floor(hours);
-    const m = Math.round((hours - h) * 60);
-    return `${h}h ${m.toString().padStart(2, '0')}m`;
-  };
+  // Uses shared HH:MM formatter (e.g. 2.63 -> "2:38")
+  const formatHoursMinutes = (hours: number) => formatHoursHMM(hours);
 
-  // Calculate stats
+  // Calculate stats from currently-loaded entries
   const totalHours = entries.reduce((acc, e) => acc + (e.totalHours || 0), 0);
   const daysWorked = entries.filter(e => e.complete).length;
   const avgDaily = daysWorked > 0 ? totalHours / daysWorked : 0;
@@ -83,6 +184,10 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
   const startIndex = (currentPage - 1) * entriesPerPage;
   const endIndex = startIndex + entriesPerPage;
   const paginatedEntries = entries.slice(startIndex, endIndex);
+
+  // Active range label
+  const activeRange = getDateRange();
+  const rangeLabel = activeRange ? formatDateRange(activeRange.start, activeRange.end) : null;
 
   const renderPaginationButtons = () => {
     const buttons = [];
@@ -157,7 +262,7 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
     return (
       <div className="p-8 text-center">
         <div className="inline-block animate-spin rounded-full h-12 w-12 border-4 border-primary border-t-transparent"></div>
-        <p className="mt-4 text-muted-foreground">Loading...</p>
+        <p className="mt-4 text-muted-foreground">Loading history…</p>
       </div>
     );
   }
@@ -183,82 +288,189 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
         </div>
 
         {/* Period Filter Buttons */}
-        <div className="flex items-center gap-1.5 bg-muted/50 p-1 rounded-lg overflow-x-auto">
-          <Button
-            variant={periodFilter === 'last-month' ? 'default' : 'ghost'}
-            size="sm"
-            onClick={() => setPeriodFilter('last-month')}
-            className="whitespace-nowrap text-xs md:text-sm h-10 md:h-9"
-          >
-            Last Month
-          </Button>
-          <Button
-            variant={periodFilter === 'this-month' ? 'default' : 'ghost'}
-            size="sm"
-            onClick={() => setPeriodFilter('this-month')}
-            className="whitespace-nowrap text-xs md:text-sm h-10 md:h-9"
-          >
-            This Month
-          </Button>
-          <Button
-            variant={periodFilter === 'custom' ? 'default' : 'ghost'}
-            size="sm"
-            onClick={() => setPeriodFilter('custom')}
-            className="whitespace-nowrap text-xs md:text-sm h-10 md:h-9"
-          >
-            Custom
-          </Button>
+        <div className="flex items-center gap-1.5 bg-indigo-50/50 backdrop-blur-sm border border-indigo-100/50 p-1.5 rounded-xl overflow-x-auto shadow-sm">
+          {(['this-week', 'last-week', 'custom'] as PeriodFilter[]).map((filter) => {
+            const labels: Record<PeriodFilter, string> = {
+              'this-week': 'This Week',
+              'last-week': 'Last Week',
+              'custom': 'Custom',
+            };
+            return (
+              <Button
+                key={filter}
+                variant={periodFilter === filter ? 'default' : 'ghost'}
+                size="sm"
+                onClick={() => {
+                  setPeriodFilter(filter);
+                  setCurrentPage(1);
+                  if (filter !== 'custom') {
+                    setAppliedRange(null);
+                  }
+                }}
+                className={`whitespace-nowrap text-xs md:text-sm h-10 md:h-9 rounded-lg transition-all ${periodFilter === filter ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-600 hover:text-indigo-700 hover:bg-white/60'}`}
+              >
+                {labels[filter]}
+              </Button>
+            );
+          })}
         </div>
       </div>
 
+      {/* Custom Date Range Picker */}
+      {periodFilter === 'custom' && (
+        <Card className="border border-indigo-200 shadow-lg bg-indigo-50/30 backdrop-blur-xl rounded-2xl">
+          <CardContent className="pt-5 pb-5">
+            <div className="flex flex-col sm:flex-row items-start sm:items-end gap-3">
+              <div className="flex-1 min-w-0">
+                <Label className="text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1.5 block">Start Date</Label>
+                <Input
+                  type="date"
+                  value={customStart}
+                  onChange={(e) => setCustomStart(e.target.value)}
+                  className="h-11 bg-white/80 border-indigo-200 rounded-xl font-medium"
+                />
+              </div>
+              <div className="flex-1 min-w-0">
+                <Label className="text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1.5 block">End Date</Label>
+                <Input
+                  type="date"
+                  value={customEnd}
+                  onChange={(e) => setCustomEnd(e.target.value)}
+                  className="h-11 bg-white/80 border-indigo-200 rounded-xl font-medium"
+                />
+              </div>
+              <Button
+                onClick={handleApplyCustom}
+                className="h-11 px-6 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold shadow-md shadow-indigo-200 transition-all"
+              >
+                <Filter className="size-4 mr-2" />
+                Apply
+              </Button>
+              {appliedRange && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setAppliedRange(null);
+                    setCustomStart('');
+                    setCustomEnd('');
+                    setEntries([]);
+                  }}
+                  className="h-11 text-slate-500 hover:text-red-600"
+                >
+                  <X className="size-4" />
+                </Button>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Active Filter Label */}
+      {rangeLabel && (
+        <div className="flex items-center gap-2 text-sm font-medium text-indigo-700 bg-indigo-50/60 border border-indigo-100 rounded-xl px-4 py-2.5">
+          <Calendar className="size-4" />
+          <span>Showing: {rangeLabel}</span>
+        </div>
+      )}
+
+      {/* Prominent Total Hours Summary Header */}
+      {entries.length > 0 && (
+        <Card className="border-2 border-indigo-200 bg-gradient-to-r from-indigo-50 via-violet-50 to-indigo-50 shadow-lg rounded-2xl">
+          <CardContent className="py-5">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <div>
+                <p className="text-xs font-semibold text-indigo-600 uppercase tracking-widest mb-1">
+                  Total Hours
+                </p>
+                <p className="text-4xl md:text-5xl font-black text-indigo-700 tabular-nums leading-none">
+                  {formatHoursHMM(totalHours)}
+                </p>
+              </div>
+              <div className="text-right">
+                <p className="text-xs font-medium text-slate-500 uppercase tracking-wider">across</p>
+                <p className="text-lg font-bold text-slate-700">
+                  {entries.length} {entries.length === 1 ? 'entry' : 'entries'}
+                </p>
+                {rangeLabel && <p className="text-xs text-slate-500 mt-0.5">{rangeLabel}</p>}
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Error Banner */}
+      {errorMessage && (
+        <Card className="border-2 border-red-200 bg-red-50/70 rounded-2xl">
+          <CardContent className="py-4">
+            <div className="flex items-center gap-3 text-red-700">
+              <AlertTriangle className="size-5 shrink-0" />
+              <p className="text-sm font-medium">{errorMessage}</p>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={loadHistory}
+              className="mt-3 text-red-700 border-red-300 hover:bg-red-100"
+            >
+              Retry
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Stats Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 md:gap-4">
-        <Card>
+        <Card className="border border-white/60 shadow-xl bg-white/70 backdrop-blur-xl rounded-2xl">
           <CardContent className="pt-4 md:pt-6">
             <div className="flex items-center gap-3 mb-2">
-              <div className="bg-primary/10 p-2 md:p-2.5 rounded-lg">
-                <Clock className="size-4 md:size-5 text-primary" />
+              <div className="bg-gradient-to-tr from-indigo-500 to-violet-400 p-2 md:p-2.5 rounded-xl shadow-sm">
+                <Clock className="size-4 md:size-5 text-white" />
               </div>
-              <span className="text-xs md:text-sm text-muted-foreground">Total Hours</span>
+              <span className="text-xs md:text-sm font-semibold text-slate-500 uppercase tracking-wider">Total Hours</span>
             </div>
-            <p className="text-2xl md:text-3xl font-bold text-foreground">{formatHoursMinutes(totalHours)}</p>
+            <p className="text-2xl md:text-3xl font-black text-slate-800 tracking-tight">{formatHoursMinutes(totalHours)}</p>
           </CardContent>
         </Card>
 
-        <Card>
+        <Card className="border border-white/60 shadow-xl bg-white/70 backdrop-blur-xl rounded-2xl">
           <CardContent className="pt-4 md:pt-6">
             <div className="flex items-center gap-3 mb-2">
-              <div className="bg-primary/10 p-2 md:p-2.5 rounded-lg">
-                <Calendar className="size-4 md:size-5 text-primary" />
+              <div className="bg-gradient-to-tr from-emerald-500 to-teal-400 p-2 md:p-2.5 rounded-xl shadow-sm">
+                <Calendar className="size-4 md:size-5 text-white" />
               </div>
-              <span className="text-xs md:text-sm text-muted-foreground">Days Worked</span>
+              <span className="text-xs md:text-sm font-semibold text-slate-500 uppercase tracking-wider">Days Worked</span>
             </div>
-            <p className="text-2xl md:text-3xl font-bold text-foreground">{daysWorked}</p>
+            <p className="text-2xl md:text-3xl font-black text-slate-800 tracking-tight">{daysWorked}</p>
           </CardContent>
         </Card>
 
-        <Card>
+        <Card className="border border-white/60 shadow-xl bg-white/70 backdrop-blur-xl rounded-2xl">
           <CardContent className="pt-4 md:pt-6">
             <div className="flex items-center gap-3 mb-2">
-              <div className="bg-primary/10 p-2 md:p-2.5 rounded-lg">
-                <Target className="size-4 md:size-5 text-primary" />
+              <div className="bg-gradient-to-tr from-amber-500 to-orange-400 p-2 md:p-2.5 rounded-xl shadow-sm">
+                <Target className="size-4 md:size-5 text-white" />
               </div>
-              <span className="text-xs md:text-sm text-muted-foreground">Avg. Daily</span>
+              <span className="text-xs md:text-sm font-semibold text-slate-500 uppercase tracking-wider">Avg. Daily</span>
             </div>
-            <p className="text-2xl md:text-3xl font-bold text-foreground">{formatHoursMinutes(avgDaily)}</p>
+            <p className="text-2xl md:text-3xl font-black text-slate-800 tracking-tight">{formatHoursMinutes(avgDaily)}</p>
           </CardContent>
         </Card>
       </div>
 
       {/* Entries - Mobile Cards / Desktop Table */}
-      {paginatedEntries.length === 0 ? (
-        <Card>
-          <CardContent className="py-12 text-center">
-            <Clock className="size-12 text-muted-foreground mx-auto mb-3" />
-            <p className="text-muted-foreground">No time entries yet</p>
+      {!errorMessage && paginatedEntries.length === 0 ? (
+        <Card className="border border-white/60 shadow-xl bg-white/70 backdrop-blur-xl rounded-2xl">
+          <CardContent className="py-16 text-center">
+            <Clock className="size-16 text-indigo-300 mx-auto mb-4 drop-shadow-sm" />
+            <p className="text-lg font-medium text-slate-500">
+              {periodFilter === 'custom' && !appliedRange
+                ? 'Select a date range and click Apply to view entries.'
+                : 'No time entries found for this period.'}
+            </p>
           </CardContent>
         </Card>
-      ) : (
+      ) : !errorMessage && (
         <>
           {/* Mobile Card View */}
           <div className="md:hidden space-y-3">
@@ -320,14 +532,15 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
           </div>
 
           {/* Desktop Table View */}
-          <Card className="hidden md:block">
-            <div className="border rounded-lg overflow-hidden">
+          <Card className="hidden md:block border border-white/60 shadow-2xl bg-white/70 backdrop-blur-xl rounded-2xl overflow-hidden">
+            <div className="overflow-hidden">
               <Table>
                 <TableHeader>
                   <TableRow className="bg-muted/50">
                     <TableHead>DATE</TableHead>
                     <TableHead>CLOCK IN</TableHead>
-                    <TableHead>LUNCH</TableHead>
+                    <TableHead>LUNCH OUT</TableHead>
+                    <TableHead>LUNCH IN</TableHead>
                     <TableHead>CLOCK OUT</TableHead>
                     <TableHead>NOTES</TableHead>
                     <TableHead className="text-right">TOTAL HOURS</TableHead>
@@ -337,15 +550,27 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
                   {paginatedEntries.map((entry) => {
                     const hasWarning = !entry.clockOutManual;
                     const hasFlags = entry.flags && entry.flags.length > 0;
+                    const segs = entry.segments || [];
+                    const isSplit = segs.length > 1;
 
-                    return (
+                    const rows: JSX.Element[] = [
                       <TableRow key={entry.id} className="hover:bg-muted/30">
                         <TableCell className="font-medium">
                           {formatDate(entry.date)}
+                          {isSplit && (
+                            <Badge variant="secondary" className="ml-2 text-[10px] bg-indigo-100 text-indigo-700 border-indigo-200">
+                              {segs.length} shifts
+                            </Badge>
+                          )}
                         </TableCell>
-                        <TableCell>{formatTime(entry.clockInManual)}</TableCell>
-                        <TableCell>{formatLunchDuration(entry)}</TableCell>
-                        <TableCell>
+                        <TableCell className="tabular-nums">{formatTime(entry.clockInManual)}</TableCell>
+                        <TableCell className="tabular-nums">
+                          {entry.skipLunch ? <span className="text-muted-foreground italic">skipped</span> : formatTime(entry.lunchOutManual)}
+                        </TableCell>
+                        <TableCell className="tabular-nums">
+                          {entry.skipLunch ? <span className="text-muted-foreground italic">skipped</span> : formatTime(entry.lunchInManual)}
+                        </TableCell>
+                        <TableCell className="tabular-nums">
                           {hasWarning ? (
                             <div className="flex items-center gap-2 text-red-600">
                               <AlertTriangle className="size-4" />
@@ -368,7 +593,7 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
                             <span className="text-muted-foreground">-</span>
                           )}
                         </TableCell>
-                        <TableCell className="text-right">
+                        <TableCell className="text-right tabular-nums">
                           {entry.totalHours ? (
                             <span className="font-semibold text-primary">
                               {formatHoursMinutes(entry.totalHours)}
@@ -378,7 +603,35 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
                           )}
                         </TableCell>
                       </TableRow>
-                    );
+                    ];
+
+                    // Split-shift sub-rows
+                    if (isSplit) {
+                      segs.forEach((seg, i) => {
+                        rows.push(
+                          <TableRow key={`${entry.id}-seg-${i}`} className="bg-slate-50/60 text-xs">
+                            <TableCell className="pl-10 text-slate-500">↳ Shift {i + 1}</TableCell>
+                            <TableCell className="tabular-nums text-slate-700">{formatTime(seg.clockInManual)}</TableCell>
+                            <TableCell className="tabular-nums text-slate-700">
+                              {seg.skipLunch ? <span className="italic text-slate-400">skipped</span> : formatTime(seg.lunchOutManual)}
+                            </TableCell>
+                            <TableCell className="tabular-nums text-slate-700">
+                              {seg.skipLunch ? <span className="italic text-slate-400">skipped</span> : formatTime(seg.lunchInManual)}
+                            </TableCell>
+                            <TableCell className="tabular-nums text-slate-700">{formatTime(seg.clockOutManual) || '—'}</TableCell>
+                            <TableCell className="text-slate-400">
+                              {seg.autoClosed ? (
+                                <Badge variant="secondary" className="text-[10px] bg-amber-100 text-amber-800 border-amber-300">auto-closed</Badge>
+                              ) : '—'}
+                            </TableCell>
+                            <TableCell className="text-right tabular-nums text-slate-700">
+                              {formatHoursMinutes((seg.workMinutes || 0) / 60)}
+                            </TableCell>
+                          </TableRow>
+                        );
+                      });
+                    }
+                    return rows;
                   })}
                 </TableBody>
               </Table>

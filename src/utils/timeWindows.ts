@@ -10,6 +10,7 @@ interface TimeWindowResult {
     reason?: string; // Reason for blockage (machine readable)
     message?: string; // Human readable message
     gracePeriod?: boolean;
+    warningMessage?: string; // Warning message text
 }
 
 /**
@@ -51,18 +52,18 @@ export function isWithinTimeWindow(workDate: string, currentTime: Date = new Dat
             };
         } else {
             return {
-                allowed: false,
-                reason: 'Time window closed',
-                message: 'Entry window has closed (deadline was 10:00 AM today). Please contact a manager for corrections.'
+                allowed: true, // Temporarily allowing entries after 10 AM
+                reason: 'time_window_closed_warning',
+                warningMessage: 'Warning: Time entered after 10:00 AM deadline. Please try to complete your entries on time in the future.'
             };
         }
     }
 
-    // More than 1 day old - locked
+    // More than 1 day old
     return {
-        allowed: false,
-        reason: 'Entry too old',
-        message: `This entry is from ${daysDiff} days ago and is now locked. Please contact a manager for corrections.`
+        allowed: true, // Temporarily allowing old entries
+        reason: 'entry_too_old_warning',
+        warningMessage: 'Warning: Time entered past the deadline. Please try to complete your entries on time in the future.'
     };
 }
 
@@ -76,7 +77,8 @@ export function isWithinTimeWindow(workDate: string, currentTime: Date = new Dat
  */
 export function isPastDeadline(workDate: string, currentTime: Date = new Date()): boolean {
     const window = isWithinTimeWindow(workDate, currentTime);
-    return !window.allowed;
+    // Since we relaxed allowed=true, we detect deadline violation via reason flag
+    return !window.allowed || window.reason?.includes('warning') === true;
 }
 
 /**
@@ -109,13 +111,9 @@ type CheckEntry = Partial<TimeEntry> & {
  * @returns { complete, reason }
  */
 export function isYesterdayComplete(yesterdayEntry: CheckEntry | null | undefined): CompletionCheckResult {
-    // No entry at all
+    // No entry at all (e.g., first day, weekend, or day off)
     if (!yesterdayEntry) {
-        return {
-            complete: false,
-            reason: 'missing',
-            message: 'No time entry found for yesterday. Please complete yesterday\'s entry before entering today\'s time.'
-        };
+        return { complete: true };
     }
 
     // Entry exists but not complete
@@ -123,7 +121,7 @@ export function isYesterdayComplete(yesterdayEntry: CheckEntry | null | undefine
         return {
             complete: false,
             reason: 'incomplete',
-            message: 'Yesterday\'s entry is incomplete. Please complete all steps before entering today\'s time.'
+            message: 'You must complete your previous day before starting a new one.'
         };
     }
 
@@ -132,7 +130,7 @@ export function isYesterdayComplete(yesterdayEntry: CheckEntry | null | undefine
         return {
             complete: false,
             reason: 'no_clock_out',
-            message: 'Yesterday\'s entry is missing Clock Out time. Please complete it before entering today\'s time.'
+            message: 'You must complete your previous day before starting a new one.'
         };
     }
 
@@ -232,6 +230,7 @@ interface AccessCheckResult {
     showSummary?: boolean;
     gracePeriod?: boolean;
     graceMessage?: string;
+    warningMessage?: string;
 }
 
 interface CheckEntryAccessParams {
@@ -273,22 +272,23 @@ export function checkEntryAccess(params: CheckEntryAccessParams): AccessCheckRes
         };
     }
 
-    // Check yesterday's completion
+    // Check yesterday's completion - TEMPORARILY DISABLED AS BLOCKER, NOW A WARNING
     const yesterdayCheck = isYesterdayComplete(yesterdayEntry);
+
+    // Aggregate warnings
+    let warningText = window.warningMessage || '';
     if (!yesterdayCheck.complete) {
-        return {
-            canAccess: false,
-            blocked: true,
-            reason: 'yesterday_incomplete',
-            message: yesterdayCheck.message
-        };
+        warningText = warningText
+            ? warningText + ' ' + 'Reminder: You forgot to clock out yesterday.'
+            : 'Reminder: You forgot to clock out yesterday. Please request a manager correction for your previous shift.';
     }
 
-    // All checks passed
+    // All checks passed (or resolved to warnings)
     return {
         canAccess: true,
         blocked: false,
         gracePeriod: window.gracePeriod || false,
-        graceMessage: window.message
+        graceMessage: window.message,
+        warningMessage: warningText || undefined
     };
 }

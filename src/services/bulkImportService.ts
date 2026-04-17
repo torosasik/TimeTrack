@@ -7,6 +7,8 @@ export interface UserImportData {
     role: string;
     active: boolean;
     sendInvite: boolean;
+    timezone?: string;
+    error?: string;
 }
 
 export interface ImportResult {
@@ -24,75 +26,76 @@ export function parseUserCSV(content: string): UserImportData[] {
     const lines = content.split(/\r?\n/).filter(line => line.trim().length > 0);
     if (lines.length === 0) return [];
 
-    // Simple header detection (assuming first line is header if it contains 'email')
     const hasHeader = lines[0].toLowerCase().includes('email');
     const dataLines = hasHeader ? lines.slice(1) : lines;
 
+    let nameIdx = 0, emailIdx = 1, roleIdx = 2, tzIdx = 3, passIdx = 4;
+    if (hasHeader) {
+        const headers = parseCSVLine(lines[0].toLowerCase());
+        nameIdx = headers.findIndex(h => h.includes('name'));
+        emailIdx = headers.findIndex(h => h.includes('email'));
+        roleIdx = headers.findIndex(h => h.includes('role'));
+
+        const foundTz = headers.findIndex(h => h.includes('timezone') || h.includes('time zone'));
+        if (foundTz !== -1) tzIdx = foundTz;
+        else tzIdx = -1; // Not present
+
+        const foundPass = headers.findIndex(h => h.includes('pass'));
+        if (foundPass !== -1) passIdx = foundPass;
+        else passIdx = -1; // Not present
+    }
+
     const users: UserImportData[] = [];
+    const seenEmails = new Set<string>();
 
     for (const line of dataLines) {
-        // Simple CSV splitter that respects quotes would be better, but for now specific to this app:
-        // We assume standad CSV: name,email,role,password,active
-        // Handling basic quotes if present
         const parts = parseCSVLine(line);
+        if (parts.length < 2) continue;
 
-        // rudimentary mapping based on position if no header logic is complex
-        // Let's try to map by assumed order: Name, Email, Role, Password, Active
-        // Or Map by header if present. 
+        const name = (nameIdx !== -1 && parts[nameIdx]) ? parts[nameIdx].trim() : '';
+        const email = (emailIdx !== -1 && parts[emailIdx]) ? parts[emailIdx].trim().toLowerCase() : '';
+        const role = (roleIdx !== -1 && parts[roleIdx]) ? parts[roleIdx].trim().toLowerCase() : 'employee';
+        const timezone = (tzIdx !== -1 && parts[tzIdx]) ? parts[tzIdx].trim() : '';
+        const password = (passIdx !== -1 && parts[passIdx]) ? parts[passIdx].trim() : '';
 
-        // For robustness, let's assume a standard order if no header map, 
-        // OR try to detect email by '@'.
+        if (!email) continue;
 
-        let name = '';
-        let email = '';
-        let role = 'employee';
-        let password = '';
-        let active = true;
+        let error: string | undefined;
 
-        if (parts.length >= 2) {
-            // Heuristic mapping
-            const emailIndex = parts.findIndex(p => p.includes('@'));
-            if (emailIndex !== -1) {
-                email = parts[emailIndex].trim();
-                // If name is before email?
-                if (emailIndex > 0) name = parts[0].trim();
-                // If Name is not set yet (email was first?), look for longest string? 
-                // Let's enforce a standard format for simplicity for the user:
-                // Name, Email, Role, Password
-            } else {
-                // Fallback to standard index
-                name = parts[0].trim();
-                email = parts[1].trim();
-            }
-
-            // Role
-            const rolePart = parts.find(p => ['admin', 'manager', 'employee'].includes(p.toLowerCase().trim()));
-            if (rolePart) role = rolePart.toLowerCase().trim();
-
-            // Password (length > 6 and not email/role/name)
-            const passPart = parts.find(p =>
-                p.length > 5 &&
-                p !== name &&
-                p !== email &&
-                p !== role &&
-                !['true', 'false', '1', '0'].includes(p.toLowerCase())
-            );
-            if (passPart) password = passPart.trim();
+        if (!['admin', 'manager', 'employee'].includes(role)) {
+            error = `Invalid role '${role}'`;
         }
-
-        if (email) {
-            users.push({
-                name: name || email.split('@')[0], // Fallback name
-                email,
-                role: role || 'employee',
-                password: password || undefined,
-                active: true, // Default active
-                sendInvite: !password // If no password provided, assume invite
-            });
+        if (timezone && !isValidTimeZone(timezone)) {
+            error = error ? `${error}, Invalid timezone '${timezone}'` : `Invalid timezone '${timezone}'`;
         }
+        if (seenEmails.has(email)) {
+            error = error ? `${error}, Duplicate email` : `Duplicate email`;
+        }
+        seenEmails.add(email);
+
+        users.push({
+            name: name || email.split('@')[0],
+            email,
+            role: error && !['admin', 'manager', 'employee'].includes(role) ? 'employee' : role,
+            password: password || undefined,
+            active: true,
+            sendInvite: !password,
+            timezone: timezone || undefined,
+            error
+        });
     }
 
     return users;
+}
+
+function isValidTimeZone(tz: string): boolean {
+    if (!tz) return false;
+    try {
+        Intl.DateTimeFormat(undefined, { timeZone: tz });
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 /**
@@ -149,6 +152,14 @@ export async function processUserImport(
     let processed = 0;
 
     for (const user of users) {
+        if (user.error) {
+            result.failed++;
+            result.errors.push({ email: user.email, error: user.error });
+            processed++;
+            if (onProgress) onProgress(processed, users.length);
+            continue;
+        }
+
         try {
             await provisionUser({
                 email: user.email,
@@ -156,7 +167,8 @@ export async function processUserImport(
                 role: user.role,
                 createdByUid,
                 sendInvite: user.sendInvite,
-                password: user.password
+                password: user.password,
+                timezone: user.timezone
             });
             result.success++;
         } catch (error: any) {

@@ -1,6 +1,9 @@
 import { useState, useEffect } from 'react';
 import { User } from '../../lib/auth';
+import { SectionHelp } from '../ui/section-help';
 import { TimeEntry, dbService } from '../../lib/database';
+import { doc, updateDoc, deleteDoc, Timestamp } from 'firebase/firestore';
+import { db } from '../../lib/firebase';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
@@ -11,7 +14,11 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../ui/dialog';
 import { UserAvatar } from '../ui/user-avatar';
 import { StatusDot } from '../ui/status-dot';
 import { EmptyState } from '../ui/empty-state';
-import { 
+import { Textarea } from '../ui/textarea';
+import { Checkbox } from '../ui/checkbox';
+import { calculateLunchMinutes, calculateTotalWorkMinutes, validateTimeEntry } from '../../../utils/timeCalculations';
+import { calculateDailyOvertimeBreakdown, getWorkWeekStartDate, DEFAULT_WORKWEEK_START_DAY } from '../../../utils/overtimeCalculations';
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -36,6 +43,12 @@ export function TeamDashboard({ user, allUsers }: TeamDashboardProps) {
   const [selectedEntry, setSelectedEntry] = useState<TimeEntry | null>(null);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [filtersExpanded, setFiltersExpanded] = useState(false);
+
+  // Edit Entry State
+  const [editEntryOpen, setEditEntryOpen] = useState(false);
+  const [editingEntry, setEditingEntry] = useState<Partial<TimeEntry> | null>(null);
+  const [originalEditingEntry, setOriginalEditingEntry] = useState<TimeEntry | null>(null);
+  const [adminNotes, setAdminNotes] = useState('');
 
   useEffect(() => {
     loadEntries();
@@ -86,7 +99,7 @@ export function TeamDashboard({ user, allUsers }: TeamDashboardProps) {
   const setQuickDate = (preset: string) => {
     const today = new Date();
     const todayStr = today.toISOString().split('T')[0];
-    
+
     switch (preset) {
       case 'today':
         setStartDate(todayStr);
@@ -161,6 +174,93 @@ export function TeamDashboard({ user, allUsers }: TeamDashboardProps) {
     setDetailsOpen(true);
   };
 
+  const handleEditClick = (entry: TimeEntry) => {
+    setEditingEntry({ ...entry });
+    setOriginalEditingEntry(entry);
+    setAdminNotes(entry.adminNotes || '');
+    setEditEntryOpen(true);
+  };
+
+  const handleSaveEdit = async () => {
+    if (!editingEntry || !originalEditingEntry || !adminNotes.trim()) {
+      toast.error('Admin notes are required');
+      return;
+    }
+
+    try {
+      if (!editingEntry.clockInManual || !editingEntry.clockOutManual) {
+        toast.error('Clock In and Clock Out are required');
+        return;
+      }
+
+      const entryToValidate: Partial<TimeEntry> = {
+        clockInManual: editingEntry.clockInManual,
+        clockOutManual: editingEntry.clockOutManual,
+        lunchOutManual: editingEntry.skipLunch ? '' : (editingEntry.lunchOutManual || ''),
+        lunchInManual: editingEntry.skipLunch ? '' : (editingEntry.lunchInManual || ''),
+      };
+
+      const errors = validateTimeEntry(entryToValidate);
+      if (errors.length > 0) {
+        toast.error(errors[0]);
+        return;
+      }
+
+      const now = Timestamp.now();
+      const lunchMinutes = calculateLunchMinutes(
+        editingEntry.skipLunch ? '' : (editingEntry.lunchOutManual || ''),
+        editingEntry.skipLunch ? '' : (editingEntry.lunchInManual || '')
+      );
+      const totalWorkMinutes = calculateTotalWorkMinutes(
+        editingEntry.clockInManual,
+        editingEntry.clockOutManual,
+        lunchMinutes
+      );
+      const ot = calculateDailyOvertimeBreakdown(totalWorkMinutes);
+      // originalEditingEntry is definitely defined here so we can guarantee we have a date
+      const workWeekStartDate = getWorkWeekStartDate(originalEditingEntry.date, DEFAULT_WORKWEEK_START_DAY);
+
+      await updateDoc(doc(db, 'timeEntries', originalEditingEntry.id), {
+        clockInManual: editingEntry.clockInManual,
+        lunchOutManual: editingEntry.skipLunch ? '' : (editingEntry.lunchOutManual || ''),
+        lunchInManual: editingEntry.skipLunch ? '' : (editingEntry.lunchInManual || ''),
+        clockOutManual: editingEntry.clockOutManual,
+        lunchSkipped: !!editingEntry.skipLunch,
+        lunchMinutes,
+        totalWorkMinutes,
+        regularMinutes: ot.regularMinutes,
+        otMinutes: ot.otMinutes,
+        doubleTimeMinutes: ot.doubleTimeMinutes,
+        workWeekStartDate,
+        dayComplete: true,
+        currentStep: 'complete',
+        correctedAt: now,
+        correctedBy: user.uid,
+        correctionNotes: adminNotes,
+        updatedAt: now,
+        updatedBy: user.uid,
+      } as any);
+
+      toast.success('Entry updated successfully');
+      setEditEntryOpen(false);
+      loadEntries();
+    } catch (error) {
+      toast.error('Failed to update entry');
+    }
+  };
+
+  const handleDeleteEntry = async (entry: TimeEntry) => {
+    if (window.confirm('Are you sure you want to delete this entry? This cannot be undone.')) {
+      try {
+        await deleteDoc(doc(db, 'timeEntries', entry.id));
+        toast.success('Entry deleted');
+        loadEntries();
+      } catch (error) {
+        toast.error('Failed to delete entry');
+      }
+    }
+  };
+
   const totalFlags = filteredEntries.reduce((acc, e) => acc + (e.flags?.length || 0), 0);
   const totalHours = filteredEntries.reduce((acc, e) => acc + (e.totalHours || 0), 0);
   const totalEntries = filteredEntries.length;
@@ -168,59 +268,76 @@ export function TeamDashboard({ user, allUsers }: TeamDashboardProps) {
 
   return (
     <div className="space-y-4">
+      <div className="flex justify-between items-center bg-white p-4 rounded-2xl border border-slate-200/80 shadow-sm mb-4">
+        <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+          Team Dashboard
+        </h2>
+        <SectionHelp 
+          title="Team Dashboard"
+          description="Track active sessions and live time punches for your workforce today."
+          sections={[
+            { title: "Status Tracking", content: "View who is clocked in, on lunch, or checked out currently." },
+            { title: "Employee Filter", content: "Drill down into a single user's daily record set across the period." },
+            { title: "Session Edits", content: "Correct entry fields or clear flawed shift starts to fix block status." }
+          ]}
+        />
+      </div>
       {/* Stats - Compact */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
-        <Card className="border-2 border-primary/20 bg-gradient-to-br from-white to-primary/5">
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="bg-primary/10 p-2.5 rounded-lg">
-                <Calendar className="size-5 text-primary" />
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+        <Card className="border-none shadow-xl bg-gradient-to-br from-indigo-500 to-violet-600 text-white rounded-2xl overflow-hidden hover:scale-[1.02] transition-transform">
+          <CardContent className="p-5">
+            <div className="flex items-center gap-4">
+              <div className="bg-white/20 p-3 rounded-xl backdrop-blur-sm">
+                <Calendar className="size-6 text-white" />
               </div>
               <div>
-                <p className="text-xs text-muted-foreground">Total Entries</p>
-                <p className="text-2xl font-bold text-foreground">{totalEntries}</p>
+                <p className="text-xs text-indigo-100 uppercase tracking-wider font-semibold">Total Time Records</p>
+                <p className="text-3xl font-black drop-shadow-md">{totalEntries}</p>
               </div>
             </div>
           </CardContent>
         </Card>
 
-        <Card className="border-2 border-green-100 bg-gradient-to-br from-white to-green-50">
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="bg-green-100 p-2.5 rounded-lg">
-                <Clock className="size-5 text-green-600" />
+        <Card className="border-none shadow-xl bg-gradient-to-br from-emerald-400 to-teal-500 text-white rounded-2xl overflow-hidden hover:scale-[1.02] transition-transform">
+          <CardContent className="p-5">
+            <div className="flex items-center gap-4">
+              <div className="bg-white/20 p-3 rounded-xl backdrop-blur-sm">
+                <Clock className="size-6 text-white" />
               </div>
               <div>
-                <p className="text-xs text-muted-foreground">Total Hours</p>
-                <p className="text-2xl font-bold text-foreground">{totalHours.toFixed(1)}</p>
+                <p className="text-xs text-emerald-100 uppercase tracking-wider font-semibold">Total Hours</p>
+                <p className="text-3xl font-black drop-shadow-md">{totalHours.toFixed(1)}</p>
               </div>
             </div>
           </CardContent>
         </Card>
 
-        <Card className="border-2 border-blue-100 bg-gradient-to-br from-white to-blue-50">
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="bg-blue-100 p-2.5 rounded-lg">
-                <Users className="size-5 text-blue-600" />
+        <Card className="border-none shadow-xl bg-gradient-to-br from-blue-400 to-cyan-500 text-white rounded-2xl overflow-hidden hover:scale-[1.02] transition-transform">
+          <CardContent className="p-5">
+            <div className="flex items-center gap-4">
+              <div className="bg-white/20 p-3 rounded-xl backdrop-blur-sm">
+                <Users className="size-6 text-white" />
               </div>
               <div>
-                <p className="text-xs text-muted-foreground">Active Employees</p>
-                <p className="text-2xl font-bold text-foreground">{activeEmployees}</p>
+                <p className="text-xs text-blue-100 uppercase tracking-wider font-semibold">Active Employees</p>
+                <p className="text-3xl font-black drop-shadow-md">{activeEmployees}</p>
               </div>
             </div>
           </CardContent>
         </Card>
 
-        <Card className="border-2 border-amber-100 bg-gradient-to-br from-white to-amber-50">
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="bg-amber-100 p-2.5 rounded-lg">
-                <AlertTriangle className="size-5 text-amber-600" />
+        <Card
+          className="cursor-pointer border-none shadow-xl bg-gradient-to-br from-amber-400 to-orange-500 text-white rounded-2xl overflow-hidden hover:scale-[1.02] transition-transform"
+          onClick={() => setStatus('flagged')}
+        >
+          <CardContent className="p-5">
+            <div className="flex items-center gap-4">
+              <div className="bg-white/20 p-3 rounded-xl backdrop-blur-sm">
+                <AlertTriangle className="size-6 text-white" />
               </div>
               <div>
-                <p className="text-xs text-muted-foreground">Flags</p>
-                <p className="text-2xl font-bold text-foreground">{totalFlags}</p>
+                <p className="text-xs text-amber-100 uppercase tracking-wider font-semibold">Flags</p>
+                <p className="text-3xl font-black drop-shadow-md">{totalFlags}</p>
               </div>
             </div>
           </CardContent>
@@ -228,10 +345,12 @@ export function TeamDashboard({ user, allUsers }: TeamDashboardProps) {
       </div>
 
       {/* Filters - Compact */}
-      <Card className="border-2 border-slate-200">
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base flex items-center gap-2">
-            <Filter className="size-4" />
+      <Card className="border border-white/60 shadow-xl bg-white/70 backdrop-blur-xl rounded-2xl">
+        <CardHeader className="pb-3 border-b border-indigo-50 bg-white/40">
+          <CardTitle className="text-base flex items-center gap-2 text-slate-800 font-bold">
+            <div className="bg-indigo-100/80 p-1.5 rounded-md">
+              <Filter className="size-4 text-indigo-600" />
+            </div>
             Filters
           </CardTitle>
         </CardHeader>
@@ -329,7 +448,7 @@ export function TeamDashboard({ user, allUsers }: TeamDashboardProps) {
           filteredEntries.map(entry => {
             const employee = allUsers.find(u => u.uid === entry.userId);
             return (
-              <Card key={entry.id} className="border-2 border-slate-200 hover:border-primary/30 transition-colors">
+              <Card key={entry.id} className="border border-white/80 shadow-md bg-white/60 backdrop-blur-md rounded-2xl hover:shadow-xl hover:-translate-y-1 transition-all duration-300">
                 <CardContent className="pt-3 pb-3">
                   <div className="flex items-center justify-between mb-3">
                     <div className="flex items-center gap-3">
@@ -366,14 +485,18 @@ export function TeamDashboard({ user, allUsers }: TeamDashboardProps) {
                             <Eye className="size-4 mr-2" />
                             View Details
                           </DropdownMenuItem>
-                          <DropdownMenuItem>
-                            <Edit className="size-4 mr-2" />
-                            Edit Entry
-                          </DropdownMenuItem>
-                          <DropdownMenuItem className="text-red-600">
-                            <Trash2 className="size-4 mr-2" />
-                            Delete Entry
-                          </DropdownMenuItem>
+                          {user.role === 'admin' && (
+                            <>
+                              <DropdownMenuItem onClick={() => handleEditClick(entry)}>
+                                <Edit className="size-4 mr-2" />
+                                Edit Entry
+                              </DropdownMenuItem>
+                              <DropdownMenuItem className="text-red-600" onClick={() => handleDeleteEntry(entry)}>
+                                <Trash2 className="size-4 mr-2" />
+                                Delete Entry
+                              </DropdownMenuItem>
+                            </>
+                          )}
                         </DropdownMenuContent>
                       </DropdownMenu>
                     </div>
@@ -493,6 +616,107 @@ export function TeamDashboard({ user, allUsers }: TeamDashboardProps) {
                   </div>
                 </div>
               )}
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit Entry Dialog */}
+      <Dialog open={editEntryOpen} onOpenChange={setEditEntryOpen}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Edit Time Entry</DialogTitle>
+          </DialogHeader>
+          {editingEntry && originalEditingEntry && (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <Label>Employee</Label>
+                  <Input value={getUserName(originalEditingEntry.userId)} disabled />
+                </div>
+                <div>
+                  <Label>Date</Label>
+                  <Input value={originalEditingEntry.date} disabled />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4 p-4 border rounded-lg">
+                <div>
+                  <Label>Clock In</Label>
+                  <Input
+                    type="time"
+                    value={editingEntry.clockInManual || ''}
+                    onChange={(e) => setEditingEntry({ ...editingEntry, clockInManual: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <Label>Clock Out</Label>
+                  <Input
+                    type="time"
+                    value={editingEntry.clockOutManual || ''}
+                    onChange={(e) => setEditingEntry({ ...editingEntry, clockOutManual: e.target.value })}
+                  />
+                </div>
+                {!editingEntry.skipLunch && (
+                  <>
+                    <div>
+                      <Label>Lunch Out</Label>
+                      <Input
+                        type="time"
+                        value={editingEntry.lunchOutManual || ''}
+                        onChange={(e) => setEditingEntry({ ...editingEntry, lunchOutManual: e.target.value })}
+                      />
+                    </div>
+                    <div>
+                      <Label>Lunch In</Label>
+                      <Input
+                        type="time"
+                        value={editingEntry.lunchInManual || ''}
+                        onChange={(e) => setEditingEntry({ ...editingEntry, lunchInManual: e.target.value })}
+                      />
+                    </div>
+                  </>
+                )}
+              </div>
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id="skipLunch"
+                  checked={!!editingEntry.skipLunch}
+                  onCheckedChange={(checked) => setEditingEntry({ ...editingEntry, skipLunch: !!checked })}
+                />
+                <Label htmlFor="skipLunch">Skip Lunch / Paid Lunch</Label>
+              </div>
+
+              <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 mt-4 space-y-1">
+                <p className="text-sm font-semibold text-slate-700 mb-2">Preview Changes</p>
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-slate-500">Total hours before:</span>
+                  <span className="font-medium">{dbService.calculateTotalHours(originalEditingEntry).toFixed(2)} hrs</span>
+                </div>
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-slate-500">Total hours after:</span>
+                  <span className="font-bold text-indigo-700">{dbService.calculateTotalHours(editingEntry as TimeEntry).toFixed(2)} hrs</span>
+                </div>
+              </div>
+
+              <div>
+                <Label>Admin Notes / Reason for Correction (Required)</Label>
+                <Textarea
+                  placeholder="Explain why this entry was corrected..."
+                  value={adminNotes}
+                  onChange={(e) => setAdminNotes(e.target.value)}
+                  className="mt-1"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 pt-4">
+                <Button variant="outline" onClick={() => setEditEntryOpen(false)}>
+                  Cancel
+                </Button>
+                <Button onClick={handleSaveEdit}>
+                  Save Changes
+                </Button>
+              </div>
             </div>
           )}
         </DialogContent>

@@ -20,6 +20,7 @@ interface ProvisionUserParams {
     createdByUid: string;
     sendInvite?: boolean;
     password?: string | null;
+    timezone?: string;
 }
 
 interface ProvisionResult {
@@ -33,7 +34,7 @@ interface ProvisionResult {
  * - Creates/updates the Firestore `users/{uid}` profile using the main Firestore instance.
  * - Optionally sends a password reset email as an "invitation".
  */
-export async function provisionUser({ email, name, role, createdByUid, sendInvite = true, password = null }: ProvisionUserParams): Promise<ProvisionResult> {
+export async function provisionUser({ email, name, role, createdByUid, sendInvite = true, password = null, timezone }: ProvisionUserParams): Promise<ProvisionResult> {
     let tempApp: FirebaseApp | null = null;
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     let tempAuth: Auth | null = null;
@@ -74,6 +75,7 @@ export async function provisionUser({ email, name, role, createdByUid, sendInvit
             active: true,
             createdAt: new Date(),
             createdBy: createdByUid,
+            timezone: timezone || Intl.DateTimeFormat().resolvedOptions().timeZone,
             ...(sendInvite ? { invitedAt: new Date(), status: 'invited' } : { status: 'active' })
         });
 
@@ -111,6 +113,7 @@ export async function provisionUser({ email, name, role, createdByUid, sendInvit
                     active: true,
                     updatedAt: new Date(),
                     updatedBy: createdByUid,
+                    ...(timezone ? { timezone } : {}),
                     status: sendInvite ? 're-invited' : 'active'
                 });
             }
