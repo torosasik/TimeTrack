@@ -1,26 +1,41 @@
-import { Clock, Coffee, LogOut, Calendar, TrendingUp } from 'lucide-react';
+import { Clock, Coffee, TrendingUp } from 'lucide-react';
 import { Card, CardContent } from '../ui/card';
 import { Badge } from '../ui/badge';
 import type { TimeSegment } from '../../lib/database';
-import { formatHoursHMM } from '../../../utils/timeCalculations';
+import { formatHoursHMM, formatInstantLocalHHMMAbbr } from '../../../utils/timeCalculations';
+import { getDisplayClock } from '../../lib/timezones';
 
 interface ClockStatusProps {
   isClockedIn: boolean;
   isOnLunch: boolean;
   activeSegment: TimeSegment | null;
-  todayTotalMinutes: number;
-  currentPTTime: string;
-  currentPTDate: string;
+  /** Actual WORK minutes today (excludes breaks). */
+  workMinutes: number;
+  /** Total BREAK minutes today (lunch durations, including in-progress). */
+  breakMinutes: number;
+  /**
+   * IANA zone id used purely for DISPLAY of the live date/time/zone label on
+   * this screen. Does not affect stored data or calculations.
+   */
+  displayTimezone: string;
+  /**
+   * IANA zone used for the "Since" banner (Req 3) — the employee's persisted
+   * local timezone. Defaults to `displayTimezone` when omitted.
+   */
+  statusTimezone?: string;
 }
 
 export function ClockStatus({
   isClockedIn,
   isOnLunch,
   activeSegment,
-  todayTotalMinutes,
-  currentPTTime,
-  currentPTDate,
+  workMinutes,
+  breakMinutes,
+  displayTimezone,
+  statusTimezone,
 }: ClockStatusProps) {
+  const displayClock = getDisplayClock(displayTimezone);
+  const sinceZone = statusTimezone ?? displayTimezone;
   const statusColor = isOnLunch
     ? 'bg-amber-100 text-amber-800 border-amber-300'
     : isClockedIn
@@ -33,11 +48,21 @@ export function ClockStatus({
     ? 'CLOCKED IN'
     : 'CLOCKED OUT';
 
-  const since = isOnLunch
+  // The "Since" start instant. Prefer the system epoch (millis) so the same
+  // instant can be formatted in two zones; fall back to the PT manual string
+  // when system millis are absent (legacy/historical segments).
+  const sinceEpoch = isOnLunch
+    ? activeSegment?.lunchOutSystem
+    : isClockedIn
+    ? activeSegment?.clockInSystem
+    : undefined;
+  const sincePTManual = isOnLunch
     ? activeSegment?.lunchOutManual
     : isClockedIn
     ? activeSegment?.clockInManual
     : null;
+  // displayClock.zoneName is already resolved ('auto' -> OS TZ name), so it
+  // doubles as the row-1 zone label per the two-row spec.
 
   return (
     <Card className="w-full border-2 shadow-sm">
@@ -45,10 +70,10 @@ export function ClockStatus({
         <div className="flex items-center justify-between">
           <div>
             <div className="text-xs uppercase tracking-widest text-muted-foreground font-medium">
-              {currentPTDate} • America/Los_Angeles
+              {displayClock.date} • {displayClock.zoneName}
             </div>
             <div className="text-5xl font-mono font-semibold tracking-tighter text-foreground tabular-nums mt-1">
-              {currentPTTime}
+              {displayClock.time}
             </div>
           </div>
 
@@ -57,22 +82,66 @@ export function ClockStatus({
           </Badge>
         </div>
 
-        {since && (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Clock className="h-4 w-4" />
-            <span>
-              Since <span className="font-mono font-medium text-foreground">{since}</span> PT
-            </span>
+        {sinceEpoch ? (
+          // Single-row "Since" display (Req 3): the start instant shown in the
+          // employee's LOCAL timezone with the short zone abbreviation, and NO
+          // date portion (e.g. "Since 10:30 PM EST").
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Clock className="h-4 w-4" />
+              <span>
+                Since{' '}
+                <span className="font-bold text-foreground tabular-nums">
+                  {formatInstantLocalHHMMAbbr(sinceEpoch, sinceZone)}
+                </span>
+              </span>
+            </div>
           </div>
-        )}
+        ) : sincePTManual ? (
+          // Degraded fallback: no system millis — show only the local manual
+          // string (can't reliably convert to another zone without the instant).
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Clock className="h-4 w-4" />
+              <span>
+                Since{' '}
+                <span className="font-bold text-foreground tabular-nums">
+                  {sincePTManual}
+                </span>{' '}
+                {displayClock.zoneName}
+              </span>
+            </div>
+          </div>
+        ) : null}
 
-        <div className="pt-2 border-t flex items-baseline justify-between">
-          <div className="flex items-center gap-2 text-muted-foreground">
+        <div className="pt-2 border-t">
+          {/* Centered header */}
+          <div className="flex items-center justify-center gap-2 text-muted-foreground">
             <TrendingUp className="h-4 w-4" />
             <span className="text-sm">Today so far</span>
           </div>
-          <div className="text-3xl font-semibold tabular-nums text-foreground">
-            {formatHoursHMM(todayTotalMinutes)}
+          {/* 3-column horizontal metrics: Work | Break | Total. Each column
+              stacks its label (normal weight, no colon) above its value
+              (bold), both center-aligned within the column. */}
+          <div className="grid grid-cols-3 gap-2 mt-2">
+            <div className="flex flex-col items-center gap-0.5">
+              <span className="text-sm text-muted-foreground">Work</span>
+              <span className="text-3xl font-bold tabular-nums text-foreground">
+                {formatHoursHMM(workMinutes / 60)}
+              </span>
+            </div>
+            <div className="flex flex-col items-center gap-0.5">
+              <span className="text-sm text-muted-foreground">Break</span>
+              <span className="text-3xl font-bold tabular-nums text-foreground">
+                {formatHoursHMM(breakMinutes / 60)}
+              </span>
+            </div>
+            <div className="flex flex-col items-center gap-0.5">
+              <span className="text-sm text-muted-foreground">Total</span>
+              <span className="text-3xl font-bold tabular-nums text-foreground">
+                {formatHoursHMM((workMinutes + breakMinutes) / 60)}
+              </span>
+            </div>
           </div>
         </div>
 

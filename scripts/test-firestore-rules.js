@@ -141,10 +141,38 @@ async function main() {
     await assertSucceeds(dref(dbOf(manager), "users", "emp-2").get());
     await assertSucceeds(dref(dbOf(admin), "users", "emp-2").get());
 
-    // only admin can update users
+    // Employees may update their OWN profile, but only self-service fields
+    // (timezone + updatedAt). Protected fields remain admin-only.
+    await assertSucceeds(
+      dref(dbOf(emp1), "users", "emp-1").set({ timezone: "Asia/Bangkok" }, { merge: true }),
+    );
+    await assertSucceeds(
+      dref(dbOf(emp1), "users", "emp-1").set(
+        { timezone: "Asia/Bangkok", updatedAt: new Date() },
+        { merge: true },
+      ),
+    );
+
+    // employee cannot update protected fields (name, role, workModel, active)
     await assertFails(
       dref(dbOf(emp1), "users", "emp-1").set({ name: "Employee 1 Updated" }, { merge: true }),
     );
+    await assertFails(
+      dref(dbOf(emp1), "users", "emp-1").set({ role: "admin" }, { merge: true }),
+    );
+    await assertFails(
+      dref(dbOf(emp1), "users", "emp-1").set({ workModel: "Remote" }, { merge: true }),
+    );
+    await assertFails(
+      dref(dbOf(emp1), "users", "emp-1").set({ active: false }, { merge: true }),
+    );
+
+    // employee cannot update another user's profile
+    await assertFails(
+      dref(dbOf(emp1), "users", "emp-2").set({ timezone: "Asia/Bangkok" }, { merge: true }),
+    );
+
+    // admin can still update any user field
     await assertSucceeds(
       dref(dbOf(admin), "users", "emp-1").set({ name: "Employee 1 Updated" }, { merge: true }),
     );
@@ -214,10 +242,58 @@ async function main() {
       dref(dbOf(admin), "auditLogs", auditLogId).set(validAuditLog),
     );
 
-    // admin cannot create audit log without reason
-    await assertFails(
+    // admin CAN create audit log without reason (policy change 2026-08:
+    // admin edits are exempt from mandatory audit notes)
+    await assertSucceeds(
       dref(dbOf(admin), "auditLogs", "test-audit-no-reason").set({
         ...validAuditLog,
+        reason: "",
+      }),
+    );
+
+    // manager CAN create audit log without reason (same exemption as admin)
+    await assertSucceeds(
+      dref(dbOf(manager), "auditLogs", "test-audit-mgr-no-reason").set({
+        occurredAt: new Date(),
+        actorUid: "manager-1",
+        actorRole: "manager",
+        action: "time_correction",
+        targetCollection: "timeEntries",
+        targetId: "emp-1_2025-12-22",
+        before: { clockInManual: "08:00" },
+        after: { clockInManual: "08:15" },
+        reason: "",
+      }),
+    );
+
+    // manager CAN create audit log with reason (redundant but ensures
+    // both branches work)
+    await assertSucceeds(
+      dref(dbOf(manager), "auditLogs", "test-audit-mgr-with-reason").set({
+        occurredAt: new Date(),
+        actorUid: "manager-1",
+        actorRole: "manager",
+        action: "time_correction",
+        targetCollection: "timeEntries",
+        targetId: "emp-1_2025-12-22",
+        before: { clockInManual: "08:00" },
+        after: { clockInManual: "08:15" },
+        reason: "Manager correction with reason",
+      }),
+    );
+
+    // employee CANNOT create audit log without reason (employee path still
+    // enforces mandatory reason for self-edits)
+    await assertFails(
+      dref(dbOf(emp1), "auditLogs", "test-audit-emp-no-reason").set({
+        occurredAt: new Date(),
+        actorUid: "emp-1",
+        actorRole: "employee",
+        action: "time_correction",
+        targetCollection: "timeEntries",
+        targetId: "emp-1_2025-12-22",
+        before: { clockInManual: "08:00" },
+        after: { clockInManual: "08:15" },
         reason: "",
       }),
     );

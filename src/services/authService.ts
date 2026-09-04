@@ -8,6 +8,7 @@ import {
     Auth
 } from 'firebase/auth';
 import { doc, getDoc, setDoc, query, collection, where, getDocs, updateDoc, deleteDoc } from 'firebase/firestore';
+import type { DocumentData, QueryDocumentSnapshot, QuerySnapshot } from 'firebase/firestore';
 import { initializeApp, deleteApp, FirebaseApp } from 'firebase/app';
 // We need to verify where firebaseConfig comes from. 
 // Based on file list, there is 'config' dir.
@@ -75,6 +76,9 @@ export async function provisionUser({ email, name, role, createdByUid, sendInvit
             createdAt: new Date(),
             createdBy: createdByUid,
             timezone: timezone || Intl.DateTimeFormat().resolvedOptions().timeZone,
+            workModel: 'On-site',
+            workModelOverride: null,
+            remotePayCalculationDay: 1,
             ...(sendInvite ? { invitedAt: new Date(), status: 'invited' } : { status: 'active' })
         });
 
@@ -85,14 +89,14 @@ export async function provisionUser({ email, name, role, createdByUid, sendInvit
         }
 
         return { uid: newUser.uid, status: sendInvite ? 'invited' : 'created' };
-    } catch (error: any) {
+    } catch (error: unknown) {
         // Handle "already exists": update Firestore profile and (optionally) resend invite email.
-        if (error?.code === 'auth/email-already-in-use') {
+        if ((error as { code?: string })?.code === 'auth/email-already-in-use') {
 
             // Find Firestore user doc by email (case-insensitive fallback)
             const usersRef = collection(db, 'users');
             const q = query(usersRef, where('email', '==', normalizedEmail));
-            let querySnapshot: any = await getDocs(q);
+            let querySnapshot: QuerySnapshot<DocumentData> | { empty: boolean; docs: QueryDocumentSnapshot<DocumentData>[] } = await getDocs(q);
 
             if (querySnapshot.empty) {
                 const allUsersSnapshot = await getDocs(collection(db, 'users'));
@@ -160,7 +164,10 @@ export async function inviteUser(email: string, name: string, role: string, crea
             createdAt: new Date(),
             createdBy: createdByUid,
             invitedAt: new Date(),
-            status: 'invited'
+            status: 'invited',
+            workModel: 'On-site',
+            workModelOverride: null,
+            remotePayCalculationDay: 1,
         });
 
         // Send Password Reset Email from TEMP auth since we are logged in as them there
@@ -168,13 +175,13 @@ export async function inviteUser(email: string, name: string, role: string, crea
 
         return newUser.uid;
 
-    } catch (error: any) {
-        if (error.code === 'auth/email-already-in-use') {
+    } catch (error: unknown) {
+        if ((error as { code?: string })?.code === 'auth/email-already-in-use') {
 
             try {
                 const usersRef = collection(db, 'users');
                 const q = query(usersRef, where('email', '==', email));
-                let querySnapshot: any = await getDocs(q);
+                let querySnapshot: QuerySnapshot<DocumentData> | { empty: boolean; docs: QueryDocumentSnapshot<DocumentData>[] } = await getDocs(q);
 
                 if (querySnapshot.empty) {
                     const allUsersSnapshot = await getDocs(collection(db, 'users'));
@@ -241,9 +248,10 @@ export async function deleteUserProfile(uid: string): Promise<void> {
 // ------------------------------------------------------------------
 
 let currentUser: FirebaseUser | null = null;
-let currentUserData: any = null;
+type UserData = Awaited<ReturnType<typeof getUserData>>;
+let currentUserData: UserData | null = null;
 
-export function initAuthListener(onAuthChange: (user: FirebaseUser | null, userData: any) => void) {
+export function initAuthListener(onAuthChange: (user: FirebaseUser | null, userData: UserData | null) => void) {
     onAuthStateChanged(auth, async (user) => {
         if (user) {
             try {
@@ -282,7 +290,7 @@ export function getCurrentUserData() {
     return currentUserData;
 }
 
-export async function getUserData(uid: string) {
+export async function getUserData(uid: string): Promise<{ uid: string } & DocumentData> {
     const userDoc = await getDoc(doc(db, 'users', uid));
     if (userDoc.exists()) {
         return { uid, ...userDoc.data() };
@@ -302,7 +310,7 @@ export function requireAuth(allowedRoles: string[] | null = null) {
             }
 
             try {
-                const userData: any = await getUserData(user.uid);
+                const userData = await getUserData(user.uid);
 
                 if (!userData.active) {
                     await auth.signOut();

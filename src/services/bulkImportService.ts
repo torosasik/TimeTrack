@@ -171,12 +171,12 @@ export async function processUserImport(
                 timezone: user.timezone
             });
             result.success++;
-        } catch (error: any) {
+        } catch (error: unknown) {
             console.error(`Import failed for ${user.email}:`, error);
             result.failed++;
             result.errors.push({
                 email: user.email,
-                error: error.message || 'Unknown error'
+                error: (error as Error).message || 'Unknown error'
             });
         }
 

@@ -31,8 +31,8 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
       await authService.loginWithGoogle();
       toast.success('Logged in with Google!');
       onLoginSuccess();
-    } catch (error: any) {
-      setErrorMsg(error.message || 'Failed to log in with Google');
+    } catch (error: unknown) {
+      setErrorMsg((error as Error).message || 'Failed to log in with Google');
       setLoading(false);
     }
   };
@@ -59,7 +59,7 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
     } catch (error) {
       // Provide user-friendly error messages based on common Firebase auth codes
       let msg = 'Authentication failed. Please check your details.';
-      const err = error as any;
+      const err = error as { code?: string; message?: string };
 
       if (err.code === 'auth/invalid-credential' || err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password') {
         msg = 'Invalid email or password.';
@@ -90,7 +90,7 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
       await authService.sendPasswordResetEmail(email);
       toast.success('Password reset email sent!');
       setView('login');
-    } catch (error) {
+    } catch {
       toast.error('Failed to send reset email');
     } finally {
       setLoading(false);

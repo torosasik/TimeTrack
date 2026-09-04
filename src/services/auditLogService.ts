@@ -6,14 +6,14 @@ export interface AuditLogEntry {
   occurredAt: Timestamp;
   actorUid: string;
   actorName?: string;
-  actorRole: 'admin' | 'manager' | 'system';
-  action: 'time_correction' | 'void_entry' | 'bulk_correction' | 'status_change';
+  actorRole: 'admin' | 'manager' | 'system' | 'employee';
+  action: 'time_correction' | 'void_entry' | 'bulk_correction' | 'status_change' | 'admin_correction_approved';
   targetCollection: 'timeEntries';
   targetId: string; // timeEntries doc id (e.g., uid_YYYY-MM-DD)
 
   // Immutable before/after snapshots (critical for legal defensibility)
-  before: Record<string, any>;
-  after: Record<string, any>;
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
 
   reason: string; // MUST be non-empty human-entered string
 
@@ -22,6 +22,28 @@ export interface AuditLogEntry {
   ip?: string;
   userAgent?: string;
   policyVersion?: string;
+}
+
+/**
+ * Recursively strip `undefined` values from an object (and nested
+ * objects/arrays). Firestore's addDoc() throws on any field whose value is
+ * `undefined` ("Unsupported field value: undefined"), so every audit payload
+ * MUST be sanitized before write. `null` is preserved (Firestore accepts it)
+ * and empty strings/numbers/booleans are left untouched.
+ */
+function stripUndefinedDeep<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map(stripUndefinedDeep) as unknown as T;
+  }
+  if (value && typeof value === 'object' && !(value instanceof Timestamp) && !(value instanceof Date)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const cleaned = stripUndefinedDeep(v);
+      if (cleaned !== undefined) out[k] = cleaned;
+    }
+    return out as T;
+  }
+  return value;
 }
 
 /**
@@ -35,21 +57,27 @@ export class AuditLogService {
 
   /**
    * Write a single immutable audit log entry for a time correction.
-   * REQUIRES non-empty reason (enforced here + UI + future rules).
-   * Throws on empty/whitespace reason or failed write.
+   * REQUIRES non-empty reason for EMPLOYEE self-edits (enforced here + UI +
+   * Firestore rules). Admin / manager / system actions MAY omit the reason
+   * (policy change 2026-08: admin edits are exempt from mandatory audit
+   * notes — the immutable audit row is still written, with an empty reason).
+   * Throws on empty/whitespace reason for employees, or on failed write.
    */
   async logTimeCorrection(params: {
     actorUid: string;
     actorName?: string;
+    actorRole?: 'admin' | 'manager' | 'system' | 'employee';
+    action?: AuditLogEntry['action'];
     targetId: string;
-    before: Record<string, any>;
-    after: Record<string, any>;
+    before: Record<string, unknown>;
+    after: Record<string, unknown>;
     reason: string;
     correctionRequestId?: string;
   }): Promise<string> {
+    const actorRole = params.actorRole ?? 'admin';
     const trimmedReason = (params.reason || '').trim();
 
-    if (!trimmedReason) {
+    if (!trimmedReason && actorRole === 'employee') {
       throw new Error('Audit log rejected: reason is required and must be non-empty');
     }
 
@@ -57,8 +85,8 @@ export class AuditLogService {
       occurredAt: Timestamp.now(),
       actorUid: params.actorUid,
       actorName: params.actorName,
-      actorRole: 'admin',
-      action: 'time_correction',
+      actorRole,
+      action: params.action ?? 'time_correction',
       targetCollection: 'timeEntries',
       targetId: params.targetId,
       before: params.before,
@@ -68,7 +96,10 @@ export class AuditLogService {
     };
 
     try {
-      const docRef = await addDoc(collection(db, this.collectionName), entry);
+      // Sanitize before write: Firestore rejects `undefined` field values.
+      // Strips optional fields (correctionRequestId, actorName) and any
+      // undefined nested in before/after snapshots.
+      const docRef = await addDoc(collection(db, this.collectionName), stripUndefinedDeep(entry));
       return docRef.id;
     } catch (err) {
       console.error('[AuditLogService] Failed to write audit log:', err);
@@ -79,9 +110,9 @@ export class AuditLogService {
   async logVoidEntry(params: {
     actorUid: string;
     actorName?: string;
-    actorRole: 'admin' | 'manager' | 'system';
+  actorRole: 'admin' | 'manager' | 'system' | 'employee';
     targetId: string;
-    before: Record<string, any>;
+    before: Record<string, unknown>;
     reason: string;
   }): Promise<string> {
     const trimmedReason = (params.reason || '').trim();
@@ -104,7 +135,7 @@ export class AuditLogService {
     };
 
     try {
-      const docRef = await addDoc(collection(db, this.collectionName), entry);
+      const docRef = await addDoc(collection(db, this.collectionName), stripUndefinedDeep(entry));
       return docRef.id;
     } catch (err) {
       console.error('[AuditLogService] Failed to write void audit log:', err);

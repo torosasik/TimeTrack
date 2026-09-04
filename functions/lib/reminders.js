@@ -39,10 +39,19 @@ const db = admin.firestore();
 exports.processReminders = functions.pubsub.schedule('every 5 minutes').onRun(async (context) => {
     functions.logger.info("Starting reminder evaluations...");
     try {
-        // 1. Fetch Global Settings
-        const settingsDoc = await db.collection('systemSettings').doc('reminders').get();
+        // 1. Fetch Global Settings (all system settings live in one doc).
+        // Read-through fallback for the single-document migration: if
+        // systemSettings/global doesn't exist yet (not migrated / no admin
+        // save since deploy), fall back to the legacy systemSettings/reminders
+        // doc so configured reminder preferences keep working instead of
+        // silently reverting to hardcoded defaults.
+        let settingsDoc = await db.collection('systemSettings').doc('global').get();
         if (!settingsDoc.exists) {
-            functions.logger.warn("systemSettings/reminders doc missing. Proceeding with defaults.");
+            functions.logger.warn("systemSettings/global missing — falling back to legacy systemSettings/reminders.");
+            settingsDoc = await db.collection('systemSettings').doc('reminders').get();
+        }
+        if (!settingsDoc.exists) {
+            functions.logger.warn("systemSettings/reminders also missing. Proceeding with defaults.");
         }
         const settings = settingsDoc.data() || {};
         const enableEmails = settings.enable_email_reminders !== false; // Default true

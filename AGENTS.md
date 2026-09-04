@@ -6,7 +6,7 @@ Welcome to the **TimeTrack** codebase. This document helps AI agents understand 
 
 - **Primary Stack**: React (Vite), Firebase (Auth, Firestore, Hosting), Tailwind CSS.
 - **Core Domain**: Employee attendance and HR records only. No client billing or project budgeting.
-- **Canonical Timezone**: `America/Los_Angeles` (PT/PST/PDT) for all payroll math and storage.
+- **Timezone Architecture**: Dual-zone by role. **Employee workflows** (clock in/out, entry doc ids `${uid}_${date}`, week boundaries, banners, work history, time adjustments) run in the **employee's local timezone** (`user.timezone`, persisted; falls back to OS zone). **Admin controls** (payroll math, Lock Payroll Period, Exclude Records From Analysis, overtime buckets) run in **California time `America/Los_Angeles` (PT)**. Epoch-millis system timestamps (`clockInSystem`/`clockOutSystem`) are the single source of truth for instants; manual `HH:MM` strings are stored in the employee's local wall clock. Admin/Manager analysis views convert epoch timestamps to local or PT via the view toggle (`src/utils/timeView.ts`).
 
 ## 🛠 Commands
 
@@ -31,9 +31,9 @@ Welcome to the **TimeTrack** codebase. This document helps AI agents understand 
 - `docs/`: Master documentation. **Read before large changes.**
 
 ### 2. Guardrails (Non-Negotiable)
-- **Timezone Integrity**: Never use browser `Date` directly for payroll calculations. Use `Intl.DateTimeFormat` or helpers in `src/utils/dateHelpers.js` forced to `America/Los_Angeles`.
+- **Timezone Integrity**: Never use browser `Date`/`new Date().toISOString()` directly for any value that affects pay or an entry's calendar date. Employee-facing dates/times use the employee's local zone via helpers in `src/utils/timeCalculations.ts` (`getLocalDate`, `getEmployeeTimezone`, `getLocalTimeHHMM`) and local-midnight splitting via `src/utils/midnightSplit.ts`. Admin payroll controls (Lock Payroll Period, Exclude Records From Analysis, OT buckets) stay in `America/Los_Angeles` via `src/utils/dateHelpers.js` / `src/utils/timeView.ts`.
 - **Soft Deletions**: Never call `.delete()` on Firestore documents. Use `status: 'voided' | 'archived'`.
-- **Audit Requirement**: Every correction to a time record must produce an immutable entry in the `auditLogs` collection including a mandatory reason.
+- **Audit Requirement**: Every correction to a time record must produce an immutable entry in the `auditLogs` collection. A human-provided `reason` is **mandatory for employee self-edits** (≤24h Quick Edit path) but **optional for admin/manager-initiated corrections** (policy change 2026-08: admin edits may have an empty reason; the audit row is still written).
 - **Role-Based Access**: Permissions are enforced via `src/utils/permissions.js` and `firestore.rules`.
 - **California Overtime**: Calculations follow specific CA rules (8h daily OT, 12h daily DT, 40h weekly OT). See [overtimeCalculations.ts](src/utils/overtimeCalculations.ts).
 
@@ -42,7 +42,9 @@ Welcome to the **TimeTrack** codebase. This document helps AI agents understand 
 - [FIREBASE_DATA_MODEL.md](docs/planning/FIRESTORE_DATA_MODEL.md): Canonical collection shapes and indexes.
 - [SECURITY_RULES_PLAN.md](docs/planning/SECURITY_RULES_PLAN.md): Security and RBAC principles.
 - [overtimeCalculations.ts](src/utils/overtimeCalculations.ts): Logic for California overtime.
-- [timeCalculations.ts](src/utils/timeCalculations.ts): Total hours and segment math.
+- [timeCalculations.ts](src/utils/timeCalculations.ts): Total hours, segment math, employee-local date/time helpers (`getLocalDate`, `getEmployeeTimezone`, `formatInstantLocalHHMMAbbr`).
+- [midnightSplit.ts](src/utils/midnightSplit.ts): Automatic local-midnight shift splitting and per-local-date totals.
+- [timeView.ts](src/utils/timeView.ts): Admin local/PT display conversion from epoch timestamps.
 - [dateHelpers.js](src/utils/dateHelpers.js): Centralized PT conversion logic.
 
 ## ⚠️ Pitfalls
@@ -90,7 +92,7 @@ These live in `.kilo/personas/`. Reference them explicitly in prompts or via the
 ### Automation You Must Use
 - `.kilo/setup-script` — Runs automatically on new worktree creation.
 - `.kilo/run-script` — Starts the Vite dev server (and optionally emulators) for that worktree.
-- `.kilo/rules/*.md` — Short injectable guardrails (timezone, mandatory audit reason, soft-delete + segments). Add these to your `instructions` array in global or project config.
+- `.kilo/rules/*.md` — Short injectable guardrails (timezone, mandatory audit reason for employees, soft-delete + segments). Add these to your `instructions` array in global or project config.
 
 ### Persistence & Recovery (Do Not Lose Your Setup Again)
 All real configuration lives in `.kilo/` and **must be committed to git**:

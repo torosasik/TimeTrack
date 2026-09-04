@@ -8,9 +8,19 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Badge } from '../ui/badge';
 import { toast } from 'sonner';
 import { TrendingUp, AlertTriangle, Users, Flag, Clock, BarChart } from 'lucide-react';
+import { useExclusionCutoff } from '../../hooks/useExclusionCutoff';
+import { filterByExclusionCutoff } from '../../../utils/exclusionFilter';
+import type { TimeViewMode } from '../../../utils/timeView';
+import { explodeDocsBySegmentLocalDate } from '../../../utils/timeView';
 
 interface PatternMetricsProps {
   allUsers: User[];
+  /**
+   * Admin timezone view (Req 4). Accepted for consistency across analysis
+   * tabs; PatternMetrics renders aggregate counts/percentages (no per-entry
+   * timestamps), so the mode currently does not alter its output.
+   */
+  timeViewMode?: TimeViewMode;
 }
 
 interface EmployeeRisk {
@@ -21,10 +31,23 @@ interface EmployeeRisk {
   riskLevel: 'high' | 'medium' | 'low';
 }
 
-export function PatternMetrics({ allUsers }: PatternMetricsProps) {
+interface PatternMetricsData {
+  summary: {
+    totalEntries: number;
+    flaggedEntries: number;
+    flaggedPercentage: number;
+    activeEmployees: number;
+  };
+  flagDistribution: Array<{ name: string; value: number }>;
+  employeeRisks: EmployeeRisk[];
+  insights: string[];
+}
+
+export function PatternMetrics({ allUsers, timeViewMode: _timeViewMode = 'local' }: PatternMetricsProps) {
   const [period, setPeriod] = useState<string>('30');
-  const [metrics, setMetrics] = useState<any>(null);
+  const [metrics, setMetrics] = useState<PatternMetricsData | null>(null);
   const [loading, setLoading] = useState(false);
+  const exclusionCutoff = useExclusionCutoff();
 
   const analyzePatterns = async () => {
     setLoading(true);
@@ -35,10 +58,17 @@ export function PatternMetrics({ allUsers }: PatternMetricsProps) {
       startDate.setDate(endDate.getDate() - days);
 
       const allEntries = await dbService.getAllTimeEntries();
-      const filteredEntries = allEntries.filter(entry => {
-        const entryDate = new Date(entry.date);
-        return entryDate >= startDate && entryDate <= endDate && entry.complete;
-      });
+      const filteredEntries = filterByExclusionCutoff(allEntries, exclusionCutoff, e => e.date)
+        // Attribute pre-fix cross-midnight split segments to their own local
+        // dates (23:32→00:28 → 07/29 + 07/30) so aggregates (entry counts,
+        // flag rates) reflect day-attributed portions, then recompute day-level
+        // flags per part so a doc-level flag isn't duplicated across halves.
+        .flatMap((entry) => explodeDocsBySegmentLocalDate([entry]))
+        .map((entry) => ({ ...entry, flags: dbService.calculateFlags(entry) }))
+        .filter(entry => {
+          const entryDate = new Date(entry.date);
+          return entryDate >= startDate && entryDate <= endDate && entry.complete;
+        });
 
       // Summary metrics
       const totalEntries = filteredEntries.length;
@@ -121,7 +151,7 @@ export function PatternMetrics({ allUsers }: PatternMetricsProps) {
       });
 
       toast.success('Analysis complete');
-    } catch (error) {
+    } catch {
       toast.error('Failed to analyze patterns');
     } finally {
       setLoading(false);
@@ -256,7 +286,7 @@ export function PatternMetrics({ allUsers }: PatternMetricsProps) {
               </CardHeader>
               <CardContent>
                 <div className="space-y-2">
-                  {metrics.flagDistribution.map((item: any, i: number) => (
+                  {metrics.flagDistribution.map((item: { name: string; value: number }, i: number) => (
                     <div key={i} className="flex items-center justify-between p-2 bg-slate-50 rounded border border-slate-200">
                       <span className="text-sm font-medium text-slate-700 capitalize">{item.name}</span>
                       <div className="flex items-center gap-2">

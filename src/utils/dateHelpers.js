@@ -87,3 +87,27 @@ export function formatDateDisplay(dateStr) {
     const date = new Date(dateStr + 'T12:00:00Z');
     return new Intl.DateTimeFormat('en-US', options).format(date);
 }
+
+/**
+ * Format a YYYY-MM-DD date as MM/DD + short PT weekday (e.g., "07/20 Mon").
+ *
+ * The weekday is derived in America/Los_Angeles by anchoring the bare ISO
+ * calendar date at noon UTC (T12:00:00Z). This mirrors formatDateDisplay and
+ * avoids off-by-one weekday errors that occur when a YYYY-MM-DD string (e.g.
+ * "2026-07-20") is parsed as a local/UTC-midnight instant on a non-PT runtime
+ * near the DST or midnight boundary. Per AGENTS.md, all payroll date display
+ * must be anchored to PT.
+ *
+ * @param {string} dateStr - Date string in YYYY-MM-DD format
+ * @returns {string} e.g. "07/20 Mon"
+ */
+export function formatDateShortWithWeekday(dateStr) {
+    const weekday = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/Los_Angeles',
+        weekday: 'short',
+    }).format(new Date(dateStr + 'T12:00:00Z'));
+    const parts = String(dateStr).split('-');
+    const month = parts[1] || '';
+    const day = parts[2] || '';
+    return `${month}/${day} ${weekday}`;
+}

@@ -252,7 +252,7 @@ export function checkTimeAnomalies(
     step: number | 'complete',
     time: string,
     workDate: string,
-    entry: any
+    entry: Partial<TimeEntry> | null
 ): AnomalyResult {
     if (!time || step === 'complete') return { hasAnomaly: false };
 
@@ -275,7 +275,7 @@ export function checkTimeAnomalies(
                 };
             }
         }
-    } catch (e) { /* ignore date parse errors */ }
+    } catch { /* ignore date parse errors */ }
 
     // 2. Early Arrival Check (Before 6:00 AM)
     if (step === 0) { // Clock In
@@ -353,12 +353,12 @@ function hasOpenSegmentLocal(entry: TimeEntry | null | undefined): boolean {
   // (the canonical implementation). Without this guard, the punchIn validator
   // and the UI both treat soft-voided test data as an open shift, which
   // makes cleanup scripts useless and forces a manual segments[] rewrite.
-  if ((entry as any).status === 'voided' || (entry as any).status === 'archived') return false;
+  if (entry.status === 'voided' || entry.status === 'archived') return false;
   if (entry.segments?.length) {
     const last = entry.segments[entry.segments.length - 1];
     if (last && last.complete !== true) return true;
   }
-  const cur = (entry as any).currentSegment as { complete?: boolean } | undefined;
+  const cur = entry.currentSegment;
   if (cur && cur.complete !== true) return true;
   if (entry.clockInManual && !entry.clockOutManual && !entry.complete) return true;
   return false;
@@ -419,4 +419,142 @@ export function getLunchActionLabel(activeSegment: TimeSegment | null): string {
     return 'END LUNCH';
   }
   return 'LUNCH DONE';
+}
+
+// ---------------------------------------------------------------------------
+// Adjustment guardrails (2026-08): pure, jest-testable validators for the
+// edit / correction flows (directEditSegmentField, directCloseShift,
+// directEndLunch, resolveCorrectionRequest, admin Correct Entry).
+// All chronology is CROSS-MIDNIGHT AWARE: times are normalized against the
+// segment's clock-in anchor — a time earlier than clock-in is treated as
+// next-day (+24h), so a valid 22:00 -> 06:00 overnight shift passes while a
+// true inversion is rejected.
+// ---------------------------------------------------------------------------
+
+export interface SegmentChronologyShape {
+  clockInManual?: string;
+  lunchOutManual?: string;
+  lunchInManual?: string;
+  clockOutManual?: string;
+  skipLunch?: boolean;
+}
+
+/** Parse HH:MM to minutes-since-midnight; null when absent/invalid. */
+function parseHHMM(v: string | null | undefined): number | null {
+  if (!v || typeof v !== 'string') return null;
+  const m = v.trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  return h * 60 + min;
+}
+
+/**
+ * Validate the chronological sequence of one shift segment.
+ * Cross-midnight aware (unlike validateTimeEntry / validateTimeSequence,
+ * which predate the wrap rule and false-reject overnight shifts).
+ *
+ * @param seg   the segment's manual punch fields (post-edit, pre-save)
+ * @param opts.allowOpen  true for a still-open shift: clockOut may be absent
+ *                        and an open lunch (lunchOut without lunchIn) is legal.
+ * @returns human-readable error strings; empty array = valid.
+ */
+export function validateSegmentChronology(
+  seg: SegmentChronologyShape,
+  opts?: { allowOpen?: boolean },
+): string[] {
+  const errors: string[] = [];
+  const inM = parseHHMM(seg.clockInManual);
+  if (inM === null) {
+    errors.push('Clock in is required');
+    return errors; // no anchor — relative checks impossible
+  }
+  // Normalize against the clock-in anchor (S6 cross-midnight wrap).
+  const wrap = (m: number): number => (m < inM ? m + 24 * 60 : m);
+
+  const outM = parseHHMM(seg.clockOutManual);
+  if (outM !== null) {
+    if (wrap(outM) <= inM) errors.push('Clock out must be after clock in');
+  } else if (!opts?.allowOpen) {
+    errors.push('Clock out is required');
+  }
+
+  if (!seg.skipLunch) {
+    const loM = parseHHMM(seg.lunchOutManual);
+    const liM = parseHHMM(seg.lunchInManual);
+    const hasLo = loM !== null;
+    const hasLi = liM !== null;
+    const openLunchOk = opts?.allowOpen === true && hasLo && !hasLi;
+    if (hasLo !== hasLi && !openLunchOk) {
+      errors.push('Both lunch times required or leave both empty');
+    }
+    if (hasLo && wrap(loM) <= inM) {
+      errors.push('Lunch out must be after clock in');
+    }
+    if (hasLo && hasLi && wrap(liM!) <= wrap(loM)) {
+      errors.push('Lunch in must be after lunch out');
+    }
+    if (outM !== null && hasLo && wrap(loM) >= wrap(outM)) {
+      errors.push('Lunch out must be before clock out');
+    }
+    if (outM !== null && hasLi && wrap(liM!) > wrap(outM)) {
+      errors.push('Lunch in must be before clock out');
+    }
+  }
+
+  return errors;
+}
+
+const FUTURE_FIELD_LABELS: [keyof Pick<TimeSegment, 'clockInSystem' | 'lunchOutSystem' | 'lunchInSystem' | 'clockOutSystem'>, string][] = [
+  ['clockInSystem', 'Clock in'],
+  ['lunchOutSystem', 'Lunch out'],
+  ['lunchInSystem', 'Lunch in'],
+  ['clockOutSystem', 'Clock out'],
+];
+
+/**
+ * Reject edits whose computed epoch timestamps land in the future.
+ * Reads the *System epoch fields (the SSOT for instants) after the manual
+ * HH:MM has been resolved to epochs via recomputeSegmentSystemTimestamps /
+ * epochFromLocalWallTime — so this works for any anchor date + timezone.
+ *
+ * @returns an error string for the first future field, or null when clean.
+ */
+export function getFuturePunchError(
+  seg: Pick<TimeSegment, 'clockInSystem' | 'lunchOutSystem' | 'lunchInSystem' | 'clockOutSystem'>,
+  nowMs: number,
+): string | null {
+  for (const [key, label] of FUTURE_FIELD_LABELS) {
+    const v = seg[key];
+    if (typeof v === 'number' && v > nowMs) {
+      return `${label} cannot be set to a time in the future.`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Reject segment sets whose [clockInSystem, clockOutSystem] intervals overlap
+ * (double-counted payroll). Only complete segments with both epochs are
+ * compared; open segments have no end interval and are skipped.
+ *
+ * @returns an error string on the first overlap found, or null when clean.
+ */
+export function getSegmentOverlapError(
+  segments: Array<Pick<TimeSegment, 'clockInSystem' | 'clockOutSystem'>>,
+): string | null {
+  const intervals: { start: number; end: number }[] = [];
+  for (const s of segments) {
+    if (typeof s.clockInSystem === 'number' && typeof s.clockOutSystem === 'number') {
+      intervals.push({ start: s.clockInSystem, end: s.clockOutSystem });
+    }
+  }
+  intervals.sort((a, b) => a.start - b.start);
+  for (let i = 1; i < intervals.length; i++) {
+    if (intervals[i].start < intervals[i - 1].end) {
+      return 'This adjustment would overlap with another shift on the same day. Adjust the times so shifts do not overlap.';
+    }
+  }
+  return null;
 }

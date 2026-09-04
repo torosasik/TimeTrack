@@ -7,13 +7,14 @@ import {
     getEntriesForWorkweek,
     calculateBiweeklyOvertimeTotals,
 } from './overtimeCalculations';
+import { getPTWeekStart } from './timeCalculations';
 
 describe('overtimeCalculations - California rules', () => {
     describe('constants', () => {
         it('workweek enum matches JS getDay() ordering', () => {
             expect(WORKWEEK_START_DAYS.SUNDAY).toBe(0);
             expect(WORKWEEK_START_DAYS.SATURDAY).toBe(6);
-            expect(DEFAULT_WORKWEEK_START_DAY).toBe(0); // default Sunday
+            expect(DEFAULT_WORKWEEK_START_DAY).toBe(1); // default Monday (aligns with getPTWeekStart)
         });
     });
 
@@ -23,9 +24,9 @@ describe('overtimeCalculations - California rules', () => {
             expect(getWorkWeekStartDate('2025-01-05', 0)).toBe('2025-01-05');
         });
 
-        it('walks back to the previous Sunday by default', () => {
-            // Wed 2025-01-08 -> Sun 2025-01-05
-            expect(getWorkWeekStartDate('2025-01-08')).toBe('2025-01-05');
+        it('walks back to the previous Monday by default', () => {
+            // Wed 2025-01-08 -> Mon 2025-01-06 (default is now Monday)
+            expect(getWorkWeekStartDate('2025-01-08')).toBe('2025-01-06');
         });
 
         it('respects a custom workweek start day (Monday)', () => {
@@ -179,8 +180,9 @@ describe('overtimeCalculations - California rules', () => {
 
     describe('calculateBiweeklyOvertimeTotals', () => {
         it('aggregates grand totals and per-week breakdown correctly', () => {
-            // Week 1 (Sun 2025-01-05): 5 * 8h = 40h regular exactly
-            // Week 2 (Sun 2025-01-12): 5 * 10h = 50h -> 40h reg + 10h OT (all daily OT, no weekly)
+            // Week 1 (Mon 2025-01-06): 5 * 8h = 40h regular exactly
+            // Week 2 (Mon 2025-01-13): 5 * 10h = 50h -> 40h reg + 10h OT (all daily OT, no weekly)
+            // Default workweek start is now Monday (aligns with getPTWeekStart).
             const w1 = Array.from({ length: 5 }, (_, i) => ({
                 workDate: `2025-01-${String(6 + i).padStart(2, '0')}`,
                 totalWorkMinutes: 480,
@@ -192,15 +194,15 @@ describe('overtimeCalculations - California rules', () => {
             const out = calculateBiweeklyOvertimeTotals([...w1, ...w2]);
 
             expect(Object.keys(out.weeklyTotals).sort()).toEqual([
-                '2025-01-05',
-                '2025-01-12',
+                '2025-01-06',
+                '2025-01-13',
             ]);
 
-            const w1Totals = out.weeklyTotals['2025-01-05'];
+            const w1Totals = out.weeklyTotals['2025-01-06'];
             expect(w1Totals.regularMinutes).toBe(2400);
             expect(w1Totals.otMinutes).toBe(0);
 
-            const w2Totals = out.weeklyTotals['2025-01-12'];
+            const w2Totals = out.weeklyTotals['2025-01-13'];
             expect(w2Totals.regularMinutes).toBe(2400);
             expect(w2Totals.otMinutes).toBe(600); // 10h daily OT
 
@@ -370,5 +372,51 @@ describe('overtimeCalculations — TZ safety + CA rules regression (W2 audit)', 
             expect(totalReg).toBe(2400);
             expect(totalOT).toBe(300); // 5h daily OT
         });
+    });
+});
+
+/**
+ * Cross-module agreement test (Kilo bot review guard).
+ *
+ * The display week (getPTWeekStart, used by getWeekSummary "This Week Total
+ * Hours") and the OT workweek (getWorkWeekStartDate, used by
+ * calculateBiweeklyOvertimeTotals for the >40h weekly-OT boundary) MUST sum
+ * over the same 7-day window. If they diverge, a Sunday shift lands in one
+ * boundary for display and another for OT — so a week shown as 40h in the UI
+ * can compute OT differently. This locks the two together across the
+ * Mon–Sun / Sun–Sat week boundary so the regression can't silently recur.
+ */
+describe('workweek boundary agreement — display vs OT', () => {
+    it('DEFAULT_WORKWEEK_START_DAY is Monday (matches getPTWeekStart)', () => {
+        expect(DEFAULT_WORKWEEK_START_DAY).toBe(WORKWEEK_START_DAYS.MONDAY);
+    });
+
+    it('getWorkWeekStartDate (default arg) === getPTWeekStart across a week boundary', () => {
+        // Sample dates spanning Mon–Sun plus a cross-month boundary.
+        const dates = [
+            '2026-07-12', // Sunday
+            '2026-07-13', // Monday
+            '2026-07-15', // Wednesday
+            '2026-07-18', // Saturday
+            '2026-07-19', // Sunday (week rollover next day)
+            '2026-07-20', // Monday (new week)
+            '2026-07-31', // Friday (month-end)
+            '2026-08-01', // Saturday (cross-month)
+        ];
+        for (const d of dates) {
+            const otWeekStart = getWorkWeekStartDate(d); // default arg
+            const displayWeekStart = getPTWeekStart(d);
+            expect({ date: d, otWeekStart, displayWeekStart }).toEqual({
+                date: d,
+                otWeekStart: displayWeekStart,
+                displayWeekStart,
+            });
+        }
+    });
+
+    it('both resolve a Sunday to the preceding Monday (not the same Sunday)', () => {
+        // 2026-07-12 is a Sunday. Monday-start week => 2026-07-06.
+        expect(getWorkWeekStartDate('2026-07-12')).toBe('2026-07-06');
+        expect(getPTWeekStart('2026-07-12')).toBe('2026-07-06');
     });
 });

@@ -1,21 +1,22 @@
 import { useEffect, useMemo, useState } from 'react';
 import { arrayUnion, collection, doc, getDoc, getDocs, limit, query, setDoc, Timestamp, updateDoc, where } from 'firebase/firestore';
+import type { DocumentData } from 'firebase/firestore';
 import { toast } from 'sonner';
 import { AlertCircle, AlertTriangle, ArrowRight, CheckCircle2, Clock, Coffee, History, LogIn, LogOut as LogOutIcon, Zap, HelpCircle, FileWarning, CalendarDays, Globe, Play, Target } from 'lucide-react';
 
 import type { User } from '../../lib/auth';
-import type { TimeEntry } from '../../lib/database';
-import { dbService } from '../../lib/database';
+import type { CorrectionRequest, TimeEntry } from '../../lib/database';
+import { dbService, buildConsistentClosePatch, createInitialSegment, stripUndefined } from '../../lib/database';
 import { db } from '../../lib/firebase';
 import { auditLogService } from '../../../services/auditLogService';
+import { findOpenShiftEntry } from '../../../services/clockService';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { Alert, AlertDescription } from '../ui/alert';
-import { Progress } from '../ui/progress';
 import { ProgressStepper } from '../ui/progress-stepper';
-import { formatHoursHMM } from '../../../utils/timeCalculations';
+import { formatHoursHMM, getEmployeeTimezone, getLocalDate } from '../../../utils/timeCalculations';
 import { dragmeService, type DragmeTask } from '../../../services/dragmeService';
 import { HelpModal } from '../ui/help-modal';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select';
@@ -24,15 +25,14 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, Di
 
 // Existing business logic (ported from the previous HTML/JS app)
  
-import { calculateLunchMinutes, calculateTotalWorkMinutes } from '../../../utils/timeCalculations';
-import { calculateDailyOvertimeBreakdown, getWorkWeekStartDate, DEFAULT_WORKWEEK_START_DAY } from '../../../utils/overtimeCalculations';
+import { deriveSegmentWorkMinutes } from '../../../utils/timeCalculations';
+import { getWorkWeekStartDate, DEFAULT_WORKWEEK_START_DAY } from '../../../utils/overtimeCalculations';
 import {
   checkTimeAnomalies,
   validateClockIn,
   validateLunchOut,
   validateLunchIn,
-  validateClockOut,
-  timeToMinutes
+  validateClockOut
 } from '@/utils/timeValidation';
 import { checkEntryAccess, getYesterdayDate } from '../../../utils/timeWindows';
 import {
@@ -75,9 +75,6 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
   const [tasks, setTasks] = useState<DragmeTask[]>([]);
   const [taskId, setTaskId] = useState<string>('');
 
-  // Shift safety / watchdog
-  const MAX_SHIFT_HOURS = 12;
-
   // Correction request modal state
   const [correctionModalOpen, setCorrectionModalOpen] = useState(false);
   const [correctionIssueType, setCorrectionIssueType] = useState('');
@@ -89,8 +86,12 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
   const [correctionDate, setCorrectionDate] = useState('');
   const [submittingCorrection, setSubmittingCorrection] = useState(false);
 
-  const tz = user.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
-  const today = useMemo(() => new Date().toISOString().split('T')[0], []);
+  const tz = getEmployeeTimezone(user.timezone);
+  // Entry doc id / date queries use the employee's LOCAL calendar date
+  // (YYYY-MM-DD in their own timezone) — NOT the UTC date (the old
+  // `new Date().toISOString().split('T')[0]` bug) and NOT fixed Pacific Time.
+  // This is the local-time-tracking refactor (Req 1).
+  const today = useMemo(() => getLocalDate(tz), [tz]);
 
   useEffect(() => {
     // Set initial manual time once on mount
@@ -119,45 +120,11 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
       try {
         const list = await dragmeService.fetchTasks();
         setTasks(list);
-      } catch (e) {
+      } catch {
         // Silent — dropdown will simply show "No tasks available".
       }
     })();
   }, []);
-
-  // Auto-close watchdog: if an open segment exceeds MAX_SHIFT_HOURS,
-  // trigger clock out automatically capped at clock-in + MAX_SHIFT_HOURS.
-  useEffect(() => {
-    if (!entry || entry.complete || !entry.clockInSystem) return;
-    const interval = setInterval(async () => {
-      if (!entry.clockInSystem) return;
-      const elapsedMs = Date.now() - entry.clockInSystem;
-      if (elapsedMs > MAX_SHIFT_HOURS * 60 * 60 * 1000 && !entry.clockOutManual) {
-        const capMs = entry.clockInSystem + MAX_SHIFT_HOURS * 60 * 60 * 1000;
-        const capDate = new Date(capMs);
-        const cappedTime = `${String(capDate.getHours()).padStart(2, '0')}:${String(capDate.getMinutes()).padStart(2, '0')}`;
-        try {
-          await updateDoc(doc(db, 'timeEntries', `${user.uid}_${today}`), {
-            clockOutManual: cappedTime,
-            clockOutSubmitted: true,
-            clockOutSystemTime: Timestamp.now(),
-            complete: true,
-            dayComplete: true,
-            completedAt: Timestamp.now(),
-            autoClosed: true,
-            updatedAt: Timestamp.now(),
-            updatedBy: user.uid,
-          } as any);
-          toast.warning(`Shift auto-closed after ${MAX_SHIFT_HOURS}h`);
-          await initLoad();
-        } catch (e) {
-          // silent retry on next tick
-        }
-      }
-    }, 60_000);
-    return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entry?.clockInSystem, entry?.complete, entry?.clockOutManual]);
 
   async function initLoad() {
     setLoading(true);
@@ -179,10 +146,10 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
       if (!TEST_MODE && !isAdmin) {
         const yesterdayDate = getYesterdayDate();
         const ySnap = await getDoc(doc(db, 'timeEntries', `${user.uid}_${yesterdayDate}`));
-        let yesterdayEntry: any = ySnap.exists() ? ySnap.data() : null;
+        let yesterdayEntry: DocumentData | null = ySnap.exists() ? ySnap.data() : null;
 
         const tSnap = await getDoc(doc(db, 'timeEntries', `${user.uid}_${today}`));
-        const todayEntryRaw: any = tSnap.exists() ? tSnap.data() : null;
+        const todayEntryRaw: DocumentData | null = tSnap.exists() ? tSnap.data() : null;
 
         // First-day exception (copied from old sequential logic)
         if (!yesterdayEntry && !todayEntryRaw) {
@@ -212,7 +179,7 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
 
       const existingEntry = await dbService.getTimeEntry(user.uid, today);
       setEntry(existingEntry);
-    } catch (e) {
+    } catch {
       toast.error('Failed to load entry');
     } finally {
       setLoading(false);
@@ -224,6 +191,25 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
     if (!validation.valid) {
       toast.error(validation.message);
       return;
+    }
+
+    // Enforce the one-open-shift invariant across recent days (including an
+    // unclosed cross-midnight shift from a previous day). This mirrors
+    // clockService.punchIn so the legacy form can't open a second overlapping
+    // shift. Block unconditionally when ANY recent doc is open — a completed
+    // TODAY doc is not exempt (findOpenShiftEntry returns null for completed
+    // docs, so the legit split-shift path still works; a ghost open shift on
+    // a PRIOR day must block the new clock-in, exactly like punchIn).
+    try {
+      const openShift = await findOpenShiftEntry(user.uid, tz);
+      if (openShift) {
+        toast.error(
+          `You already have an open shift (started ${openShift.date}). Clock out before starting a new one.`
+        );
+        return;
+      }
+    } catch {
+      // Fall back to the local check below if the cross-day scan fails.
     }
 
     // Block only if there's an OPEN (incomplete) clock-in. Completed entries
@@ -239,15 +225,42 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
 
     // --- Split shift: archive previous completed segment, start a fresh one. ---
     if (entry?.complete && entry.clockInManual && entry.clockOutManual) {
-      const priorArchivedMins =
-        (entry.segments || [])
-          .slice(0, -1) // exclude the "current" synthesized segment (last)
-          .reduce((s, seg) => s + (seg.workMinutes || 0), 0);
-      const lastMins = (entry.segments?.[entry.segments.length - 1]?.workMinutes) || 0;
-      const accumulatedMinutes = priorArchivedMins + lastMins;
+      // Derive the just-completed shift's minutes directly from the top-level
+      // legacy fields. `entry.segments` (per mapEntry) contains ONLY previously
+      // archived shifts, NOT the current one — so reading `segments[last]`
+      // returns the wrong (or no) value. On the first split, segments[] is
+      // empty and the prior code wrote workMinutes: 0, losing shift #1's total.
+      // Uses the shared canonical helper so this stays in sync with mapEntry.
+      const justCompletedMins = deriveSegmentWorkMinutes(
+        entry.clockInManual,
+        entry.clockOutManual,
+        entry.skipLunch,
+        entry.lunchOutManual,
+        entry.lunchInManual,
+      );
+
+      // entry.segments holds only previously-archived shifts (no synthesized
+      // current lives there). Sum all of them, then add the just-completed
+      // shift to get the running day total.
+      const priorArchivedMins = (entry.segments || []).reduce(
+        (s, seg) => s + (seg.workMinutes || 0),
+        0,
+      );
+      const accumulatedMinutes = priorArchivedMins + justCompletedMins;
+
+      // S7 (split-shift consistency): persist the new OPEN segment into
+      // segments[] alongside the just-completed (closed) segment, mirroring
+      // clockService.punchIn. Without this, segments[] ends in the closed
+      // seg1 while the open seg2 lives only in top-level fields — which
+      // triggers mapEntry's S1 fallback to inherit seg1's clockOutManual
+      // up to the entry, falsely rendering seg2 as complete ("looks clocked
+      // out" bug). Ending segments[] in an open segment keeps every reader
+      // (ClockPunch, HistoryView, getActiveSegment) seeing the live open
+      // shift correctly.
+      const openSeg = stripUndefined(createInitialSegment(currentTime, now.toMillis(), taskId || undefined));
 
       await updateDoc(doc(db, 'timeEntries', entryId), {
-        // Archive the just-completed segment into the stored segments[] list
+        // Archive the just-completed segment AND append the new open segment
         segments: arrayUnion({
           id: `seg_${Date.now()}`,
           clockInManual: entry.clockInManual,
@@ -259,10 +272,10 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
           clockOutManual: entry.clockOutManual,
           clockOutSystemTime: entry.clockOutSystem ? new Date(entry.clockOutSystem) : null,
           skipLunch: !!entry.skipLunch,
-          workMinutes: lastMins,
-          taskId: (entry as any).taskId || null,
+          workMinutes: justCompletedMins,
+          taskId: entry.taskId || null,
           complete: true,
-        }),
+        }, openSeg),
         // Reset the "current segment" top-level fields for a fresh shift
         clockInManual: currentTime,
         clockInSubmitted: true,
@@ -288,7 +301,7 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
         updatedAt: now,
         updatedBy: user.uid,
         ...(anomalyLog && { anomaly_flag: true }),
-      } as any);
+      });
       return;
     }
 
@@ -345,7 +358,7 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
       updatedAt: now,
       updatedBy: user.uid,
       ...(anomalyLog && { anomaly_flag: true }),
-    } as any);
+    });
   }
 
   async function submitLunchIn(anomalyLog = false) {
@@ -376,7 +389,7 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
       updatedAt: now,
       updatedBy: user.uid,
       ...(anomalyLog && { anomaly_flag: true }),
-    } as any);
+    });
   }
 
   async function submitClockOut(anomalyLog = false) {
@@ -405,24 +418,27 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
       return;
     }
 
-    // Calculate current-segment minutes
-    let segMins = 0;
-    const cIn = timeToMinutes(entry.clockInManual);
-    const cOut = timeToMinutes(currentTime);
-    segMins = cOut - cIn;
-
-    if (!entry.skipLunch && entry.lunchOutManual && entry.lunchInManual) {
-      const lOut = timeToMinutes(entry.lunchOutManual);
-      const lIn = timeToMinutes(entry.lunchInManual);
-      segMins -= (lIn - lOut);
-    }
-
-    // Include previously-archived segments so the day total reflects split shifts.
-    const archivedMins =
-      (entry.segments || [])
-        .slice(0, -1) // exclude the synthesized "current" segment (last)
-        .reduce((s, seg) => s + (seg.workMinutes || 0), 0);
-    const totalMins = archivedMins + Math.max(0, segMins);
+    // S7: derive the closed segment + day total via the canonical
+    // buildConsistentClosePatch (closeActiveSegment math: S6 cross-midnight
+    // wrap + lunch deduction) so root fields, segments[last], and
+    // totalWorkMinutes are written together and can never diverge. 'append'
+    // preserves prior archived split-shift segments. This replaces the
+    // manual deriveSegmentWorkMinutes + archivedMins sum so the stored
+    // segment's workMinutes and totalWorkMinutes always agree.
+    const closePatch = buildConsistentClosePatch({
+      clockIn: entry.clockInManual,
+      clockOut: currentTime,
+      skipLunch: !!entry.skipLunch,
+      lunchOut: entry.skipLunch ? undefined : (entry.lunchOutManual || undefined),
+      lunchIn: entry.skipLunch ? undefined : (entry.lunchInManual || undefined),
+      clockOutSystem: Date.now(),
+      clockInSystem: entry.clockInSystem,
+      taskId: entry.taskId || undefined,
+      existingSegments: entry.segments,
+      mode: 'append',
+    });
+    const totalMins = closePatch.totalWorkMinutes;
+    const segMins = closePatch.closedSegment.workMinutes ?? 0;
 
     const now = Timestamp.now();
     const entryId = `${user.uid}_${today}`;
@@ -430,15 +446,18 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
       clockOutManual: currentTime,
       clockOutSubmitted: true,
       clockOutSystemTime: now,
+      clockOutSystem: now.toMillis(),
       complete: true,
       dayComplete: true, // Legacy flag
+      currentStep: 4,
       completedAt: now,
+      segments: closePatch.segments,
       totalWorkMinutes: totalMins, // Raw minutes for admin rules later
       currentSegmentMinutes: Math.max(0, segMins),
       updatedAt: now,
       updatedBy: user.uid,
       ...(anomalyLog && { anomaly_flag: true }),
-    } as any);
+    });
 
     // Push to Dragme (best-effort, non-blocking on UI success)
     if (taskId) {
@@ -450,8 +469,8 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
           date: today,
           userId: user.uid,
         })
-        .catch((err: any) => {
-          toast.error(`Dragme sync failed: ${err?.message || 'unknown error'}`);
+        .catch((err: unknown) => {
+          toast.error(`Dragme sync failed: ${(err as Error)?.message || 'unknown error'}`);
         });
     }
   }
@@ -486,8 +505,8 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
 
       toast.success('Time submitted successfully');
       await initLoad();
-    } catch (e: any) {
-      toast.error(e?.message || 'Failed to submit time');
+    } catch (e: unknown) {
+      toast.error((e as Error)?.message || 'Failed to submit time');
     } finally {
       setSubmitting(false);
     }
@@ -518,8 +537,8 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
       await submitLunchOut(true);
       toast.success('Lunch skipped');
       await initLoad();
-    } catch (e: any) {
-      toast.error(e?.message || 'Failed to skip lunch');
+    } catch (e: unknown) {
+      toast.error((e as Error)?.message || 'Failed to skip lunch');
     } finally {
       setSubmitting(false);
     }
@@ -546,7 +565,7 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
         voidReason: 'Employee voided via test mode',
         updatedAt: Timestamp.now(),
         updatedBy: user.uid,
-      } as any);
+      });
       toast.success('Entry voided');
       await initLoad();
     } catch {
@@ -716,8 +735,8 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
                 await submitClockIn(false);
                 toast.success('New shift started');
                 await initLoad();
-              } catch (e: any) {
-                toast.error(e?.message || 'Failed to start new shift');
+              } catch (e: unknown) {
+                toast.error((e as Error)?.message || 'Failed to start new shift');
               } finally {
                 setSubmitting(false);
               }
@@ -869,8 +888,8 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
 
       toast.success('Manager notified for correction.');
       await initLoad();
-    } catch (e: any) {
-      toast.error('Failed to request correction: ' + (e.message || 'Unknown error'));
+    } catch (e: unknown) {
+      toast.error('Failed to request correction: ' + ((e as Error).message || 'Unknown error'));
     } finally {
       setSubmitting(false);
     }
@@ -906,7 +925,7 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
         }
       }
 
-      const payload: any = {
+      const payload: Omit<CorrectionRequest, 'id'> = {
         employee_id: user.uid,
         employee_name: user.name,
         requested_date: targetDate,
@@ -936,7 +955,7 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
       setCorrectionRequestedOut('');
       setCorrectionRequestedLunch('');
       setCorrectionDate('');
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.error('[CorrectionRequest] Failed to submit:', e);
       toast.error('Failed to submit correction request. Please ensure all data is valid and try again.');
     } finally {
@@ -959,7 +978,6 @@ export function TodayEntry({ user, onViewHistory }: TodayEntryProps) {
   }
 
   const { steps, currentStep } = getStepInfo();
-  const progress = (currentStep / 4) * 100;
 
   const stepperSteps = [
     { id: 'clock-in', label: 'Clock In' },

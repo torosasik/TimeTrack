@@ -42,6 +42,7 @@ users/{uid}
   phone_number?: string
   sms_opt_in?: boolean
   timezone?: string (IANA; display preference only — does not affect payroll math)
+  remotePayCalculationDay?: number  // integer 1–28; pay-calc anchor day for Remote employees; written as 1 on user creation, backfilled to 1 on all existing docs (admin-init migration); editable for Remote users via User Base → Edit User (visible only when workModel == "Remote"; omitted from the write payload for non-Remote users so the stored value survives work-model toggles)
 
   // Phase 2 additions (leave planning)
   department?: string

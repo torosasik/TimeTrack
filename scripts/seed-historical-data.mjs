@@ -104,10 +104,10 @@ function createTimeEntry(uid, dateStr, type) {
         entry.complete = false;
         entry.dayComplete = false;
         entry.totalHours = 0;
-    } else if (type === 'late_submission') {
+    } else if (type === 'manual_gap') {
         // Clock in at 9:00, but submitted at 10:00 (1 hour gap)
         entry.clockInSystem = baseDate.setHours(10, 0, 0, 0);
-        // This will trigger 'late_submission' flag in AuditViewer
+        // Shows a large manual-vs-system gap in the Audit tab's gap columns
     } else if (type === 'batch_submission') {
         // All timestamps close together
         const now = Date.now();
@@ -156,9 +156,9 @@ async function main() {
         // 4. Incomplete day (Today) - assuming they clocked in
         entries.push(createTimeEntry(uid, formatDate(today), 'incomplete'));
 
-        // 5. Late submission (4 days ago)
+        // 5. Manual/system gap (4 days ago)
         const d4 = new Date(today); d4.setDate(today.getDate() - 4);
-        entries.push(createTimeEntry(uid, formatDate(d4), 'late_submission'));
+        entries.push(createTimeEntry(uid, formatDate(d4), 'manual_gap'));
 
         // 6. Batch submission (5 days ago)
         const d5 = new Date(today); d5.setDate(today.getDate() - 5);

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { User } from '../../lib/auth';
 import { TimeEntry, dbService } from '../../lib/database';
 import { Button } from '../ui/button';
@@ -7,9 +7,14 @@ import { Badge } from '../ui/badge';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../ui/table';
-import { ArrowLeft, AlertTriangle, Clock, Calendar, Target, ChevronLeft, ChevronRight, Filter, X } from 'lucide-react';
+import { ArrowLeft, AlertTriangle, Clock, Calendar, Target, Briefcase, ChevronLeft, ChevronRight, Filter, X, Pencil, ClipboardList } from 'lucide-react';
 import { toast } from 'sonner';
-import { formatHoursHMM } from '../../../utils/timeCalculations';
+import { formatHoursHMM, getEmployeeTimezone } from '../../../utils/timeCalculations';
+import { displayTimeForView, explodeDocsBySegmentLocalDate } from '../../../utils/timeView';
+import { TimeAdjustmentModal } from './TimeAdjustmentModal';
+import { DailyReportsEditModal } from './DailyReportsEditModal';
+import { listWorkModels, type WorkModel as WorkModelDef } from '../../../services/workModelsService';
+import { isRemoteWorkModel } from '../../../utils/workModelUtils';
 
 interface HistoryViewProps {
   user: User;
@@ -18,17 +23,18 @@ interface HistoryViewProps {
 
 type PeriodFilter = 'this-week' | 'last-week' | 'custom';
 
-/** Get Monday of the current week in the given timezone, as YYYY-MM-DD */
-function getWeekBounds(timezone: string, offset: 'this' | 'last'): { start: string; end: string } {
-  // Get "now" in the employee's timezone
+/** Get Monday of the current employee-LOCAL week, as YYYY-MM-DD.
+ * The range edges are computed in the employee's local timezone so they match
+ * the stored `workDate` values, which are local calendar dates per the
+ * local-time-tracking refactor (see .kilo/rules/timezone-enforcement.md). */
+function getWeekBounds(offset: 'this' | 'last', timezone?: string): { start: string; end: string } {
+  const tz = getEmployeeTimezone(timezone);
+  // Get "now" in the employee's local zone
   const now = new Date();
-  const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' });
-  const todayStr = formatter.format(now); // YYYY-MM-DD in employee TZ
+  const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
+  const todayStr = formatter.format(now); // YYYY-MM-DD in local zone
   const [y, m, d] = todayStr.split('-').map(Number);
-  // Bug fix: previously `new Date(y, m-1, d)` then `.getDay()` which depended on
-  // the runtime's local TZ. For a UTC server + a non-UTC user, the JS Date is
-  // built as local-midnight on the server which is the wrong wall-clock.
-  // Now use UTC-anchored Date so getUTCDay() is stable.
+  // UTC-anchored Date so getUTCDay() is stable regardless of runtime TZ.
   const todayUtc = new Date(Date.UTC(y, m - 1, d));
 
   // JS getDay(): 0=Sun. We want Monday=0.
@@ -63,7 +69,11 @@ function formatDateRange(start: string, end: string): string {
 }
 
 export function HistoryView({ user, onBack }: HistoryViewProps) {
+  // Employee's local timezone drives week bounds and all timestamp display
+  // (Req 2c). Falls back to the OS zone when the profile has none.
+  const employeeTz = useMemo(() => getEmployeeTimezone(user.timezone), [user.timezone]);
   const [entries, setEntries] = useState<TimeEntry[]>([]);
+  const [adjustmentOpen, setAdjustmentOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [periodFilter, setPeriodFilter] = useState<PeriodFilter>('this-week');
@@ -75,14 +85,24 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
   const [customEnd, setCustomEnd] = useState('');
   const [appliedRange, setAppliedRange] = useState<{ start: string; end: string } | null>(null);
 
-  const tz = user.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  // Edit Daily Reports modal (Remote employees only). workModels is loaded so
+  // Remote-ness resolves via the authoritative workModelId → name lookup
+  // (isRemoteWorkModel SSOT), the same precedence used across the app.
+  const [dailyReportsOpen, setDailyReportsOpen] = useState(false);
+  const [workModels, setWorkModels] = useState<WorkModelDef[]>([]);
+  useEffect(() => {
+    listWorkModels()
+      .then(setWorkModels)
+      .catch(e => console.error('Failed to load work models for daily-reports visibility', e));
+  }, []);
+  const isRemote = useMemo(() => isRemoteWorkModel(user, workModels), [user, workModels]);
 
   const getDateRange = useCallback((): { start: string; end: string } | null => {
-    if (periodFilter === 'this-week') return getWeekBounds(tz, 'this');
-    if (periodFilter === 'last-week') return getWeekBounds(tz, 'last');
+    if (periodFilter === 'this-week') return getWeekBounds('this', employeeTz);
+    if (periodFilter === 'last-week') return getWeekBounds('last', employeeTz);
     if (periodFilter === 'custom') return appliedRange;
     return null;
-  }, [periodFilter, tz, appliedRange]);
+  }, [periodFilter, appliedRange, employeeTz]);
 
   const loadHistory = useCallback(async () => {
     setLoading(true);
@@ -93,13 +113,27 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
       if (range) {
         console.log(`[History] Querying entries for ${user.uid} from ${range.start} to ${range.end}`);
         data = await dbService.getTimeEntriesForUserInRange(user.uid, range.start, range.end);
+        // S3: Hide soft-deleted (voided/archived) docs so they don't render
+        // as "Missing/Incomplete" rows alongside the real entry for the same
+        // PT date. Legacy docs without a status field default to 'active'
+        // in mapEntry, so historical data is preserved.
+        data = data.filter((e) => e.status !== 'voided' && e.status !== 'archived');
+        // Attribute pre-fix cross-midnight split segments to their own local
+        // dates: a 23:32→00:28 shift stored on the 07/29 doc renders as two
+        // rows — 23:32→23:59 under 07/29 and 00:00→00:28 under 07/30.
+        data = explodeDocsBySegmentLocalDate(data);
+        // Restore newest-first order: the explosion emits a pre-fix doc's
+        // dates ascending, breaking the workDate-desc order from Firestore.
+        // Stable sort keeps segments within a date in chronological order.
+        data.sort((a, b) => b.date.localeCompare(a.date));
       } else {
         // No range (custom not yet applied) — show nothing
         data = [];
       }
       setEntries(data);
-    } catch (error: any) {
-      const msg = error?.message || error?.code || 'Unknown error';
+    } catch (error: unknown) {
+      const err = error as { message?: string; code?: string };
+      const msg = err?.message || err?.code || 'Unknown error';
       console.error('[History] Failed to load history:', error);
       setErrorMessage(`Failed to load history: ${msg}`);
       setEntries([]);
@@ -120,10 +154,8 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
     if (periodFilter === 'custom' && !appliedRange) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setEntries([]);
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setLoading(false);
     } else if (periodFilter === 'custom' && appliedRange) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       loadHistory();
     }
   }, [periodFilter, appliedRange, loadHistory]);
@@ -168,6 +200,14 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
     return `${displayHour}:${minutes} ${ampm}`;
   };
 
+  // Req 2c: display a boundary in the employee's LOCAL timezone. Prefer the
+  // absolute epoch-ms system timestamp (converted to local), else the stored
+  // manual string (which for new entries is already the local wall clock).
+  const formatBoundary = (ms: number | undefined, manual: string | undefined): string => {
+    const shown = displayTimeForView(ms, manual, 'local', employeeTz);
+    return formatTime(shown);
+  };
+
   const formatLunchDuration = (entry: TimeEntry) => {
     if (entry.skipLunch) return 'Skipped';
     if (!entry.lunchOutManual || !entry.lunchInManual) return '-';
@@ -182,9 +222,110 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
   // Uses shared HH:MM formatter (e.g. 2.63 -> "2:38")
   const formatHoursMinutes = (hours: number) => formatHoursHMM(hours);
 
+  // Compute the day's CLOCK IN / CLOCK OUT boundaries from the segments[].
+  // For multi-shift days the parent summary row must show the EARLIEST clock-in
+  // and the LATEST clock-out across all shifts, not the entry-level fields
+  // (which may hold the wrong shift's value). Segments are sorted ascending by
+  // clockInManual (zero-padded "HH:MM" compares chronologically). If the
+  // latest segment is still open (no clockOut), isOpen is true so the caller
+  // shows the open-clock-out indicator.
+  const getDayBoundaries = (entry: TimeEntry): {
+    clockIn?: string; clockOut?: string; isOpen: boolean;
+    clockInMs?: number; clockOutMs?: number;
+  } => {
+    const segs = entry.segments;
+    if (!segs || segs.length === 0) {
+      return {
+        clockIn: entry.clockInManual, clockOut: entry.clockOutManual,
+        isOpen: !entry.clockOutManual,
+        clockInMs: entry.clockInSystem, clockOutMs: entry.clockOutSystem,
+      };
+    }
+    // Sort chronologically by clockIn (string compare works on "HH:MM").
+    const sorted = [...segs].sort((a, b) => (a.clockInManual || '').localeCompare(b.clockInManual || ''));
+    const first = sorted[0];
+    const last = sorted[sorted.length - 1];
+    // Latest clock-out: prefer the epoch timestamp for true chronology.
+    let latestClockOut: string | undefined;
+    let latestClockOutMs: number | undefined;
+    for (const s of sorted) {
+      const outMs = typeof s.clockOutSystem === 'number' ? s.clockOutSystem : undefined;
+      if (outMs !== undefined) {
+        if (latestClockOutMs === undefined || outMs > latestClockOutMs) {
+          latestClockOutMs = outMs;
+          latestClockOut = s.clockOutManual;
+        }
+      } else if (s.clockOutManual && (!latestClockOut || s.clockOutManual > latestClockOut)) {
+        latestClockOut = s.clockOutManual;
+      }
+    }
+    return {
+      clockIn: first?.clockInManual || entry.clockInManual,
+      clockOut: latestClockOut,
+      isOpen: !last?.clockOutManual,
+      clockInMs: typeof first?.clockInSystem === 'number' ? first.clockInSystem : entry.clockInSystem,
+      clockOutMs: latestClockOutMs ?? entry.clockOutSystem,
+    };
+  };
+
+  // Compute the parent summary row's lunch break display across all segments.
+  // A "lunch break" is a segment with BOTH lunchOutManual and lunchInManual
+  // (a completed break). Segments with skipLunch or a missing half don't count.
+  // 3-way display:
+  //   - 0 breaks → show '-' (caller renders empty → '-' via formatTime)
+  //   - 1 break  → show that break's exact lunchOut / lunchIn
+  //   - 2+ breaks → show "Multiple" to signal more than one break period
+  const getDayLunchSummary = (entry: TimeEntry): {
+    lunchOut?: string;
+    lunchIn?: string;
+    lunchOutMs?: number;
+    lunchInMs?: number;
+    isMultiple: boolean;
+  } => {
+    const segs = entry.segments;
+    if (!segs || segs.length === 0) {
+      const hasBreak = !!entry.lunchOutManual && !!entry.lunchInManual;
+      return {
+        lunchOut: hasBreak ? entry.lunchOutManual : undefined,
+        lunchIn: hasBreak ? entry.lunchInManual : undefined,
+        lunchOutMs: hasBreak ? entry.lunchOutSystem : undefined,
+        lunchInMs: hasBreak ? entry.lunchInSystem : undefined,
+        isMultiple: false,
+      };
+    }
+    // Collect completed lunch breaks, sorted by lunchOutManual (chronological).
+    const breaks = segs
+      .filter(s => !s.skipLunch && !!s.lunchOutManual && !!s.lunchInManual)
+      .sort((a, b) => (a.lunchOutManual || '').localeCompare(b.lunchOutManual || ''));
+
+    if (breaks.length === 0) {
+      return { isMultiple: false };
+    }
+    if (breaks.length === 1) {
+      return {
+        lunchOut: breaks[0].lunchOutManual,
+        lunchIn: breaks[0].lunchInManual,
+        lunchOutMs: breaks[0].lunchOutSystem,
+        lunchInMs: breaks[0].lunchInSystem,
+        isMultiple: false,
+      };
+    }
+    return { isMultiple: true };
+  };
+
   // Calculate stats from currently-loaded entries
   const totalHours = entries.reduce((acc, e) => acc + (e.totalHours || 0), 0);
-  const daysWorked = entries.filter(e => e.complete).length;
+  // Days worked = DISTINCT local dates with a completed entry (entries are
+  // already exploded by segment localDate above, so a pre-fix cross-midnight
+  // shift counts both days; same-date duplicate docs count once).
+  const daysWorked = new Set(entries.filter(e => e.complete).map(e => e.workDate ?? e.date)).size;
+  // SHIFTS WORKED: count of completed shifts across all segments in the
+  // period. A single day with a split shift (2 segments) counts as 2 shifts,
+  // matching the segment model in AGENTS.md §2.
+  const shiftsWorked = entries.reduce(
+    (acc, e) => acc + (e.segments?.filter(s => s.complete).length || (e.complete ? 1 : 0)),
+    0,
+  );
   const avgDaily = daysWorked > 0 ? totalHours / daysWorked : 0;
 
   // Pagination
@@ -291,11 +432,34 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
               Back
             </Button>
           </div>
-          <h1 className="text-2xl md:text-3xl font-bold text-foreground">My History</h1>
+          <h1 className="text-2xl md:text-3xl font-bold text-foreground -mt-[3px]">My Work History</h1>
           <p className="text-sm text-muted-foreground">View your past time entries and total hours worked.</p>
         </div>
 
-        {/* Period Filter Buttons */}
+        <div className="flex flex-col gap-2 md:flex-row md:items-center">
+          {/* Edit Daily Reports entry point — Remote employees only. */}
+          {isRemote && (
+            <Button
+              variant="outline"
+              onClick={() => setDailyReportsOpen(true)}
+              className="h-10 border-indigo-200 text-indigo-700 hover:bg-indigo-50 hover:text-indigo-800"
+            >
+              <ClipboardList className="size-4 mr-1.5" />
+              Edit Daily Reports
+            </Button>
+          )}
+
+          {/* Quick Edit & Correction Request entry point */}
+          <Button
+            variant="outline"
+            onClick={() => setAdjustmentOpen(true)}
+            className="h-10 border-indigo-200 text-indigo-700 hover:bg-indigo-50 hover:text-indigo-800"
+          >
+            <Pencil className="size-4 mr-1.5" />
+            Edit / Request Time Adjustments
+          </Button>
+
+          {/* Period Filter Buttons */}
         <div className="flex items-center gap-1.5 bg-indigo-50/50 backdrop-blur-sm border border-indigo-100/50 p-1.5 rounded-xl overflow-x-auto shadow-sm">
           {(['this-week', 'last-week', 'custom'] as PeriodFilter[]).map((filter) => {
             const labels: Record<PeriodFilter, string> = {
@@ -321,6 +485,7 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
               </Button>
             );
           })}
+        </div>
         </div>
       </div>
 
@@ -382,31 +547,6 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
         </div>
       )}
 
-      {/* Prominent Total Hours Summary Header */}
-      {entries.length > 0 && (
-        <Card className="border-2 border-indigo-200 bg-gradient-to-r from-indigo-50 via-violet-50 to-indigo-50 shadow-lg rounded-2xl">
-          <CardContent className="py-5">
-            <div className="flex items-center justify-between flex-wrap gap-3">
-              <div>
-                <p className="text-xs font-semibold text-indigo-600 uppercase tracking-widest mb-1">
-                  Total Hours
-                </p>
-                <p className="text-4xl md:text-5xl font-black text-indigo-700 tabular-nums leading-none">
-                  {formatHoursHMM(totalHours)}
-                </p>
-              </div>
-              <div className="text-right">
-                <p className="text-xs font-medium text-slate-500 uppercase tracking-wider">across</p>
-                <p className="text-lg font-bold text-slate-700">
-                  {entries.length} {entries.length === 1 ? 'entry' : 'entries'}
-                </p>
-                {rangeLabel && <p className="text-xs text-slate-500 mt-0.5">{rangeLabel}</p>}
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
       {/* Error Banner */}
       {errorMessage && (
         <Card className="border-2 border-red-200 bg-red-50/70 rounded-2xl">
@@ -428,7 +568,7 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
       )}
 
       {/* Stats Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 md:gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4">
         <Card className="border border-white/60 shadow-xl bg-white/70 backdrop-blur-xl rounded-2xl">
           <CardContent className="pt-4 md:pt-6">
             <div className="flex items-center gap-3 mb-2">
@@ -450,6 +590,18 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
               <span className="text-xs md:text-sm font-semibold text-slate-500 uppercase tracking-wider">Days Worked</span>
             </div>
             <p className="text-2xl md:text-3xl font-black text-slate-800 tracking-tight">{daysWorked}</p>
+          </CardContent>
+        </Card>
+
+        <Card className="border border-white/60 shadow-xl bg-white/70 backdrop-blur-xl rounded-2xl">
+          <CardContent className="pt-4 md:pt-6">
+            <div className="flex items-center gap-3 mb-2">
+              <div className="bg-gradient-to-tr from-sky-500 to-blue-400 p-2 md:p-2.5 rounded-xl shadow-sm">
+                <Briefcase className="size-4 md:size-5 text-white" />
+              </div>
+              <span className="text-xs md:text-sm font-semibold text-slate-500 uppercase tracking-wider">Shifts Worked</span>
+            </div>
+            <p className="text-2xl md:text-3xl font-black text-slate-800 tracking-tight">{shiftsWorked}</p>
           </CardContent>
         </Card>
 
@@ -483,7 +635,9 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
           {/* Mobile Card View */}
           <div className="md:hidden space-y-3">
             {paginatedEntries.map((entry) => {
-              const hasWarning = !entry.clockOutManual;
+              const boundaries = getDayBoundaries(entry);
+              const lunch = getDayLunchSummary(entry);
+              const hasWarning = boundaries.isOpen || !entry.clockOutManual;
               const hasFlags = entry.flags && entry.flags.length > 0;
 
               return (
@@ -512,15 +666,23 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
                     <div className="grid grid-cols-2 gap-2 mb-2">
                       <div className="bg-muted/50 p-2.5 rounded border">
                         <p className="text-xs text-muted-foreground mb-1">Clock In</p>
-                        <p className="text-sm font-bold">{formatTime(entry.clockInManual)}</p>
+                        <p className="text-sm font-bold">{formatBoundary(boundaries.clockInMs, boundaries.clockIn)}</p>
                       </div>
                       <div className="bg-muted/50 p-2.5 rounded border">
                         <p className="text-xs text-muted-foreground mb-1">Clock Out</p>
-                        <p className="text-sm font-bold">{formatTime(entry.clockOutManual) || '-'}</p>
+                        <p className="text-sm font-bold">{hasWarning ? '—' : (formatBoundary(boundaries.clockOutMs, boundaries.clockOut) || '-')}</p>
                       </div>
                       <div className="bg-muted/50 p-2.5 rounded border">
                         <p className="text-xs text-muted-foreground mb-1">Lunch</p>
-                        <p className="text-sm font-bold">{formatLunchDuration(entry)}</p>
+                        <p className="text-sm font-bold">
+                          {lunch.isMultiple ? (
+                            'Multiple breaks'
+                          ) : lunch.lunchOut && lunch.lunchIn ? (
+                            formatLunchDuration({ ...entry, lunchOutManual: lunch.lunchOut, lunchInManual: lunch.lunchIn } as TimeEntry)
+                          ) : (
+                            '-'
+                          )}
+                        </p>
                       </div>
                       <div className="bg-muted/50 p-2.5 rounded border">
                         <p className="text-xs text-muted-foreground mb-1">Status</p>
@@ -556,7 +718,9 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
                 </TableHeader>
                 <TableBody>
                   {paginatedEntries.map((entry) => {
-                    const hasWarning = !entry.clockOutManual;
+                    const boundaries = getDayBoundaries(entry);
+                    const lunch = getDayLunchSummary(entry);
+                    const hasWarning = boundaries.isOpen || !entry.clockOutManual;
                     const hasFlags = entry.flags && entry.flags.length > 0;
                     const segs = entry.segments || [];
                     const isSplit = segs.length > 1;
@@ -571,12 +735,24 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
                             </Badge>
                           )}
                         </TableCell>
-                        <TableCell className="tabular-nums">{formatTime(entry.clockInManual)}</TableCell>
+                        <TableCell className="tabular-nums">{formatBoundary(boundaries.clockInMs, boundaries.clockIn)}</TableCell>
                         <TableCell className="tabular-nums">
-                          {entry.skipLunch ? <span className="text-muted-foreground italic">skipped</span> : formatTime(entry.lunchOutManual)}
+                          {lunch.isMultiple ? (
+                            <span className="text-muted-foreground italic">Multiple</span>
+                          ) : lunch.lunchOut ? (
+                            formatBoundary(lunch.lunchOutMs, lunch.lunchOut)
+                          ) : (
+                            <span className="text-muted-foreground">-</span>
+                          )}
                         </TableCell>
                         <TableCell className="tabular-nums">
-                          {entry.skipLunch ? <span className="text-muted-foreground italic">skipped</span> : formatTime(entry.lunchInManual)}
+                          {lunch.isMultiple ? (
+                            <span className="text-muted-foreground italic">Multiple</span>
+                          ) : lunch.lunchIn ? (
+                            formatBoundary(lunch.lunchInMs, lunch.lunchIn)
+                          ) : (
+                            <span className="text-muted-foreground">-</span>
+                          )}
                         </TableCell>
                         <TableCell className="tabular-nums">
                           {hasWarning ? (
@@ -585,7 +761,7 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
                               <span className="font-medium">Missing</span>
                             </div>
                           ) : (
-                            formatTime(entry.clockOutManual)
+                            formatBoundary(boundaries.clockOutMs, boundaries.clockOut)
                           )}
                         </TableCell>
                         <TableCell>
@@ -619,14 +795,14 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
                         rows.push(
                           <TableRow key={`${entry.id}-seg-${i}`} className="bg-slate-50/60 text-xs">
                             <TableCell className="pl-10 text-slate-500">↳ Shift {i + 1}</TableCell>
-                            <TableCell className="tabular-nums text-slate-700">{formatTime(seg.clockInManual)}</TableCell>
+                            <TableCell className="tabular-nums text-slate-700">{formatBoundary(seg.clockInSystem, seg.clockInManual)}</TableCell>
                             <TableCell className="tabular-nums text-slate-700">
-                              {seg.skipLunch ? <span className="italic text-slate-400">skipped</span> : formatTime(seg.lunchOutManual)}
+                              {seg.skipLunch ? <span className="italic text-slate-400">skipped</span> : formatBoundary(seg.lunchOutSystem, seg.lunchOutManual)}
                             </TableCell>
                             <TableCell className="tabular-nums text-slate-700">
-                              {seg.skipLunch ? <span className="italic text-slate-400">skipped</span> : formatTime(seg.lunchInManual)}
+                              {seg.skipLunch ? <span className="italic text-slate-400">skipped</span> : formatBoundary(seg.lunchInSystem, seg.lunchInManual)}
                             </TableCell>
-                            <TableCell className="tabular-nums text-slate-700">{formatTime(seg.clockOutManual) || '—'}</TableCell>
+                            <TableCell className="tabular-nums text-slate-700">{formatBoundary(seg.clockOutSystem, seg.clockOutManual) || '—'}</TableCell>
                             <TableCell className="text-slate-400">
                               {seg.autoClosed ? (
                                 <Badge variant="secondary" className="text-[10px] bg-amber-100 text-amber-800 border-amber-300">auto-closed</Badge>
@@ -675,6 +851,23 @@ export function HistoryView({ user, onBack }: HistoryViewProps) {
             <ChevronRight className="size-4" />
           </Button>
         </div>
+      )}
+
+      <TimeAdjustmentModal
+        user={user}
+        open={adjustmentOpen}
+        onClose={() => setAdjustmentOpen(false)}
+        onSaved={loadHistory}
+      />
+
+      {/* Edit Daily Reports modal — rendered only for Remote employees (the
+          trigger button is hidden otherwise), so no extra role check here. */}
+      {isRemote && (
+        <DailyReportsEditModal
+          user={user}
+          open={dailyReportsOpen}
+          onClose={() => setDailyReportsOpen(false)}
+        />
       )}
     </div>
   );

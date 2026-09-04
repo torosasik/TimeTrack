@@ -29,7 +29,11 @@ export default [
       ...js.configs.recommended.rules,
       ...tsPlugin.configs.recommended.rules,
       ...reactHooks.configs.recommended.rules,
-      'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],
+      'react-refresh/only-export-components': ['warn', {
+        allowConstantExport: true,
+        // shadcn/ui files export cva variant helpers and context hooks alongside components
+        allowExportNames: ['badgeVariants', 'buttonVariants', 'toggleVariants', 'navigationMenuTriggerStyle', 'useSidebar'],
+      }],
       '@typescript-eslint/no-explicit-any': 'warn',
       '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_' }],
     },
@@ -48,6 +52,8 @@ export default [
       // Tests mock global.Date with a class extending a saved constructor reference;
       // ESLint cannot statically prove the base is a constructor.
       'constructor-super': 'off',
+      // Test mocks (Firestore snapshots, jest.fn chains) legitimately need `any`.
+      '@typescript-eslint/no-explicit-any': 'off',
     },
   },
 ];

@@ -40,8 +40,20 @@ service cloud.firestore {
         request.resource.data.role == 'employee'
       );
       
-      // Only admins can update/delete user data
-      allow update, delete: if hasRole('admin');
+      // Admins can update any user field. Non-admin users may update only
+      // their OWN profile, and only self-service fields (timezone + the
+      // `updatedAt` bookkeeping timestamp). Protected fields like role,
+      // workModel, workModelId, active, and uid remain admin-only, so an
+      // employee cannot escalate their own role or change their work model.
+      function isSelfServiceProfileUpdate() {
+        return isAuthenticated() &&
+          request.auth.uid == userId &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['timezone', 'updatedAt']);
+      }
+
+      allow update: if hasRole('admin') || isSelfServiceProfileUpdate();
+      allow delete: if hasRole('admin');
     }
     
     // Time entries collection
@@ -99,19 +111,62 @@ service cloud.firestore {
       allow read: if isAuthenticated() && document == 'payroll';
     }
 
+    // workModels collection — per-work-model overtime configuration
+    // (On-site, Remote, custom). Read by any authenticated user: employee-side
+    // components (e.g. the ClockPunch Daily Report trigger) need the
+    // authoritative workModelId → name lookup. This grants employees net-new
+    // read access to policy-level configuration (model names, OT/DT thresholds
+    // and multipliers, noOvertime) — accepted because the collection holds no
+    // per-employee data, no pay rates, and no PII. Write stays admin-only
+    // since it affects pay math.
+    match /workModels/{modelId} {
+      allow read: if isAuthenticated();
+      allow write: if hasRole('admin');
+    }
+
     // auditLogs collection — immutable append-only audit trail
     // Created by Phase 1 admin correction hardening
     match /auditLogs/{logId} {
       // Admins and managers can read audit logs
       allow read: if hasRole('admin') || hasRole('manager');
       
-      // Only admins can create audit log entries (service-layer enforced)
-      // Entry must have required fields and non-empty reason
-      allow create: if hasRole('admin') && 
-                       request.resource.data.reason is string &&
-                       request.resource.data.reason.size() > 0 &&
-                       request.resource.data.targetCollection is string &&
-                       request.resource.data.occurredAt != null;
+      // Create: admins/managers (any correction) OR employees performing a SELF
+      // direct edit (≤24h Quick Edit path).
+      //
+      // ADMIN/MANAGER PATH (policy change 2026-08): admins and managers may
+      // create audit logs with an EMPTY reason — the immutable audit row is
+      // still written, but the mandatory-note requirement is lifted for
+      // admin/manager-initiated edits.
+      //
+      // EMPLOYEE PATH: tightly scoped so a user can only audit their OWN
+      // self-correction:
+      //   - actorRole == 'employee'
+      //   - actorUid == the authenticated user
+      //   - action == 'time_correction' on 'timeEntries' only
+      //   - targetId is their own entry doc (uid_YYYY-MM-DD)
+      //   - reason is a non-empty string (mandatory for employees)
+      // This keeps the mandatory-audit rule (AGENTS.md / .kilo/rules/
+      // audit-mandatory-reason.md) intact for employee-initiated direct edits
+      // without letting users forge audit rows for other people's records.
+      allow create: if (
+                    // Admin/manager path: reason optional (may be empty or omitted)
+                    ((hasRole('admin') || hasRole('manager')) &&
+                      request.resource.data.targetCollection is string &&
+                      request.resource.data.occurredAt != null)
+                    ||
+                    // Employee self-edit path: reason mandatory
+                    (isAuthenticated() &&
+                      request.resource.data.actorRole == 'employee' &&
+                      request.resource.data.actorUid == request.auth.uid &&
+                      request.resource.data.action == 'time_correction' &&
+                      request.resource.data.targetCollection == 'timeEntries' &&
+                      request.resource.data.targetId is string &&
+                      request.resource.data.targetId.matches(request.auth.uid + '_.*') &&
+                      request.resource.data.reason is string &&
+                      request.resource.data.reason.size() > 0 &&
+                      request.resource.data.occurredAt != null
+                    )
+                  );
       
       // IMMUTABLE: no updates or deletes for any role
       allow update, delete: if false;

@@ -141,6 +141,20 @@
   html {
     font-size: var(--font-size);
     font-family: var(--font-sans);
+    overflow-y: scroll;
+    scrollbar-gutter: stable;
+  }
+
+  /* Prevent layout shift caused by Radix/Shadcn dropdown scroll locking.
+     Radix adds data-scroll-locked to <body> and injects inline padding-right
+     when a modal select/popover opens, which pushes centered content. Neutralize
+     it so opening a dropdown never shifts the page. (modal={false} on the
+     primitives prevents the lock entirely for non-modal dropdowns; this rule
+     is a belt-and-suspenders guard for any modal-mode consumer.) */
+  body[data-scroll-locked] {
+    padding-right: 0px !important;
+    margin-right: 0px !important;
+    overflow: auto !important;
   }
 
   h1,

@@ -13,6 +13,10 @@ import { cn } from "./utils";
 function Select({
   ...props
 }: React.ComponentProps<typeof SelectPrimitive.Root>) {
+  // Radix Select v2 removed the `modal` prop: the select no longer locks body
+  // scroll or injects padding-right when open, so centered page content no
+  // longer shifts. (The old `modal={false}` prop is a type error and no-op
+  // on v2.1.x.)
   return <SelectPrimitive.Root data-slot="select" {...props} />;
 }
 

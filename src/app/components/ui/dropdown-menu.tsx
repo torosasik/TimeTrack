@@ -9,7 +9,11 @@ import { cn } from "./utils";
 function DropdownMenu({
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Root>) {
-  return <DropdownMenuPrimitive.Root data-slot="dropdown-menu" {...props} />;
+  // modal={false} prevents Radix from locking body scroll / injecting
+  // padding-right when a dropdown opens, which otherwise shifts centered page
+  // content. Standard dropdown menus here are non-modal, so disabling the
+  // modal scroll-lock is safe and removes the jitter.
+  return <DropdownMenuPrimitive.Root data-slot="dropdown-menu" modal={false} {...props} />;
 }
 
 function DropdownMenuPortal({

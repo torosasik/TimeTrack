@@ -8,6 +8,7 @@ import {
     isEntryComplete,
     parseDate,
     formatDateDisplay,
+    formatDateShortWithWeekday,
 } from './dateHelpers';
 import {
     canEditEntry,
@@ -29,7 +30,10 @@ import {
 
 describe('dateHelpers', () => {
     it('formatDateYYYYMMDD zero-pads', () => {
-        expect(formatDateYYYYMMDD(new Date(2025, 0, 5))).toBe('2025-01-05');
+        // Anchor at noon UTC: PT is always UTC-7/-8, so the instant falls on the
+        // same PT calendar day on any machine TZ. A local constructor like
+        // `new Date(2025, 0, 5)` would be TZ-dependent (fails east of UTC-8).
+        expect(formatDateYYYYMMDD(new Date(Date.UTC(2025, 0, 5, 12)))).toBe('2025-01-05');
     });
 
     it('parseDate returns UTC-anchored date — use UTC getters for verification', () => {
@@ -307,6 +311,44 @@ describe('dateHelpers — TZ safety regression (W2 audit)', () => {
             const result = formatDateDisplay('2026-09-01');
             expect(result).toMatch(/Tuesday/);
             expect(result).toMatch(/Sep/);
+        });
+    });
+
+    describe('formatDateShortWithWeekday — PT MM/DD + short weekday', () => {
+        it('renders MM/DD + short weekday for a Sunday in PT', () => {
+            // Jun 14 2026 = Sunday in PT (matches formatDateDisplay assertion)
+            expect(formatDateShortWithWeekday('2026-06-14')).toBe('06/14 Sun');
+        });
+
+        it('renders MM/DD + short weekday for a Tuesday in PT', () => {
+            // Sep 1 2026 = Tuesday in PT
+            expect(formatDateShortWithWeekday('2026-09-01')).toBe('09/01 Tue');
+        });
+
+        it('zero-pads single-digit month/day', () => {
+            // Jan 5 2026 = Monday in PT
+            expect(formatDateShortWithWeekday('2026-01-05')).toBe('01/05 Mon');
+        });
+
+        it('is stable in Europe/London TZ (noon-UTC anchor regression)', () => {
+            const originalTZ = process.env.TZ;
+            process.env.TZ = 'Europe/London';
+            try {
+                // Noon-UTC anchor keeps the PT weekday stable regardless of runtime TZ
+                expect(formatDateShortWithWeekday('2026-06-14')).toBe('06/14 Sun');
+            } finally {
+                process.env.TZ = originalTZ ?? '';
+            }
+        });
+
+        it('is stable in Asia/Tokyo TZ (noon-UTC anchor regression)', () => {
+            const originalTZ = process.env.TZ;
+            process.env.TZ = 'Asia/Tokyo';
+            try {
+                expect(formatDateShortWithWeekday('2026-06-14')).toBe('06/14 Sun');
+            } finally {
+                process.env.TZ = originalTZ ?? '';
+            }
         });
     });
 
